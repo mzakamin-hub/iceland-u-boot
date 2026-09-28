@@ -1,0 +1,30 @@
+From 2b2828941625c07e9492c315b4d407169422243d Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Mon, 28 Sep 2026 01:39:45 +0000
+Subject: [PATCH 2/2] configs: iceland: No fastboot flashing, keep the console
+ for 'oem console'
+
+During bring-up U-Boot must not be able to write storage: disable
+FASTBOOT_FLASH so its fastboot only offers boot/getvar/reboot. Record
+the console (CONSOLE_RECORD) and enable 'fastboot oem console' so the
+U-Boot log can be read over USB without a serial port.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ configs/iceland_defconfig | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/configs/iceland_defconfig b/configs/iceland_defconfig
+index 39fb50338..e13976a01 100644
+--- a/configs/iceland_defconfig
++++ b/configs/iceland_defconfig
+@@ -22,3 +22,9 @@ CONFIG_BLKMAP=y
+ # CONFIG_FAT_WRITE is not set
+ # CONFIG_EXT4_WRITE is not set
+ CONFIG_EFI_VARIABLE_NO_STORE=y
++# Bring-up safety: U-Boot's fastboot cannot write to storage (boot/getvar/reboot only)
++# CONFIG_FASTBOOT_FLASH is not set
++# Keep U-Boot's console in RAM so it can be read over USB with 'fastboot oem console'
++CONFIG_CONSOLE_RECORD=y
++CONFIG_CONSOLE_RECORD_OUT_SIZE=0x20000
++CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y

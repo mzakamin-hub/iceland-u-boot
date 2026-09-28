@@ -1,7 +1,7 @@
 From aea774d436a5eebee10dcb64223681c94f939e75 Mon Sep 17 00:00:00 2001
 From: mzak <mzak.amin@gmail.com>
 Date: Mon, 28 Sep 2026 00:40:31 +0000
-Subject: [PATCH] board: qualcomm: Add OnePlus Pad 4
+Subject: [PATCH 1/2] board: qualcomm: Add OnePlus Pad 4
 
 Support for the OnePlus Pad 4 (iceland, SM8850P), chainloaded by ABL.
 Same SoC and PMICs as the OnePlus 15, so the board is derived from
