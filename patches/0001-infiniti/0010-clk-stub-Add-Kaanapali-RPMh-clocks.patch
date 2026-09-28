@@ -1,0 +1,22 @@
+From 8f62d17bc232e4ed8e6e75c0bfbbf7f8dc5f2371 Mon Sep 17 00:00:00 2001
+From: Victor Fuentes <victor@vlinkz.dev>
+Date: Sat, 26 Sep 2026 22:46:00 -0700
+Subject: [PATCH 10/14] clk: stub: Add Kaanapali RPMh clocks
+
+Signed-off-by: Victor Fuentes <victor@vlinkz.dev>
+---
+ drivers/clk/clk-stub.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/clk/clk-stub.c b/drivers/clk/clk-stub.c
+index 4a6c71016..33d0c5a5b 100644
+--- a/drivers/clk/clk-stub.c
++++ b/drivers/clk/clk-stub.c
+@@ -49,6 +49,7 @@ static struct clk_ops stub_clk_ops = {
+ };
+ 
+ static const struct udevice_id stub_clk_ids[] = {
++	{ .compatible = "qcom,kaanapali-rpmh-clk" },
+ 	{ .compatible = "qcom,qcs615-rpmh-clk" },
+ 	{ .compatible = "qcom,rpmcc" },
+ 	{ .compatible = "qcom,sa8775p-rpmh-clk" },

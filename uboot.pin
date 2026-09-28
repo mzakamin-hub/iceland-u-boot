@@ -1,0 +1,20 @@
+# Upstream base the patch queue applies to (sourced by scripts/prepare.sh).
+UPSTREAM_URL=https://github.com/u-boot/u-boot
+UPSTREAM_TAG=v2026.10-rc5
+UPSTREAM_COMMIT=a06e89ab05eaa2b8344d521319399333cd760ae5
+
+# 0001-infiniti = infiniti-mainline/u-boot main (OnePlus 15, same SoC and ABL family):
+INFINITI_URL=https://github.com/infiniti-mainline/u-boot
+INFINITI_COMMIT=bce42004f0758b477e5bb1affcf38592fe3c4a23
+TREE_AFTER_0001_infiniti=578741d3a7e31d8dbd7b26fb6ec606ef6ca70dab
+# 0002-iceland = OnePlus Pad 4 board:
+TREE_AFTER_0002_iceland=a7d9b489bb2ee1c8c0277d0bc6b7b44baef188e7
+
+# AOSP mkbootimg (Apache-2.0), LineageOS mirror, fetched at build time (not vendored)
+MKBOOTIMG_URL=https://github.com/LineageOS/android_system_tools_mkbootimg
+MKBOOTIMG_COMMIT=808ecd09666ffe0ff5800f02af693abce56eb395
+
+# Boot image header values: must match the stock boot image (anti-rollback). Stock boot_a on 11.A.38:
+# Android 16, security patch 2026-08 (verify against the stock boot.img header before flashing).
+BOOT_OS_VERSION=16.0.0
+BOOT_OS_PATCH_LEVEL=2026-08

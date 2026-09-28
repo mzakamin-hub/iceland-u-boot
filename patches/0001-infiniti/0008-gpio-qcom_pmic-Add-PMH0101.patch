@@ -1,0 +1,22 @@
+From 12e6aab3f8463a8b106f74a70df8b20e3900687d Mon Sep 17 00:00:00 2001
+From: Victor Fuentes <victor@vlinkz.dev>
+Date: Sat, 26 Sep 2026 22:49:57 -0700
+Subject: [PATCH 08/14] gpio: qcom_pmic: Add PMH0101
+
+Signed-off-by: Victor Fuentes <victor@vlinkz.dev>
+---
+ drivers/gpio/qcom_pmic_gpio.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpio/qcom_pmic_gpio.c b/drivers/gpio/qcom_pmic_gpio.c
+index 65b698db5..03b7f12d6 100644
+--- a/drivers/gpio/qcom_pmic_gpio.c
++++ b/drivers/gpio/qcom_pmic_gpio.c
+@@ -354,6 +354,7 @@ static const struct udevice_id qcom_gpio_ids[] = {
+ 	{ .compatible = "qcom,pms405-gpio" },
+ 	{ .compatible = "qcom,pm6125-gpio" },
+ 	{ .compatible = "qcom,pm8150-gpio" },
++	{ .compatible = "qcom,pmh0101-gpio" },
+ 	{ }
+ };
+ 

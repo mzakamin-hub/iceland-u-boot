@@ -1,0 +1,50 @@
+From bce42004f0758b477e5bb1affcf38592fe3c4a23 Mon Sep 17 00:00:00 2001
+From: Victor Fuentes <victor@vlinkz.dev>
+Date: Sun, 27 Sep 2026 01:32:03 -0700
+Subject: [PATCH 14/14] board: qualcomm: infiniti: Boot with EFI from the
+ userdata partition
+
+The OS image in the userdata partition has its own partition table. Map
+it with blkmap and boot with the EFI boot manager, falling back to
+fastboot over USB. Never write to it.
+
+Signed-off-by: Victor Fuentes <victor@vlinkz.dev>
+---
+ board/qualcomm/infiniti.env | 6 ++++++
+ configs/infiniti_defconfig  | 6 ++++++
+ 2 files changed, 12 insertions(+)
+ create mode 100644 board/qualcomm/infiniti.env
+
+diff --git a/board/qualcomm/infiniti.env b/board/qualcomm/infiniti.env
+new file mode 100644
+index 000000000..8bd996709
+--- /dev/null
++++ b/board/qualcomm/infiniti.env
+@@ -0,0 +1,6 @@
++stdin=serial,button-kbd
++stdout=serial,vidconsole
++stderr=serial,vidconsole
++bootdelay=0
++userdata_blkmap=scsi scan && part start scsi 0 userdata ud_start && part size scsi 0 userdata ud_size && blkmap create userdata && blkmap map userdata 0 ${ud_size} linear scsi 0 ${ud_start}
++bootcmd=run userdata_blkmap; bootefi bootmgr; fastboot usb 0
+diff --git a/configs/infiniti_defconfig b/configs/infiniti_defconfig
+index b8cce22ed..410121da4 100644
+--- a/configs/infiniti_defconfig
++++ b/configs/infiniti_defconfig
+@@ -3,6 +3,8 @@
+ # CONFIG_EFI_RUNTIME_UPDATE_CAPSULE is not set
+ # CONFIG_EFI_CAPSULE_ON_DISK is not set
+ CONFIG_DEFAULT_DEVICE_TREE="kaanapali-oneplus-infiniti"
++CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/infiniti.env"
++CONFIG_ENV_RELOC_GD_ENV_ADDR=y
+ CONFIG_LNX_KRNL_IMG_TEXT_OFFSET_BASE=0x0
+ CONFIG_PHY_QCOM_M31_EUSB2=y
+ # CONFIG_QCOM_RPMH_POWER_DOMAIN is not set
+@@ -16,3 +18,7 @@ CONFIG_VIDEO_FONT_16X32=y
+ # CONFIG_REQUIRE_SERIAL_CONSOLE is not set
+ CONFIG_BUTTON_GPIO=y
+ CONFIG_BUTTON_REMAP_PHONE_KEYS=y
++CONFIG_BLKMAP=y
++# CONFIG_FAT_WRITE is not set
++# CONFIG_EXT4_WRITE is not set
++CONFIG_EFI_VARIABLE_NO_STORE=y

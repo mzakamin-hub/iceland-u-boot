@@ -1,0 +1,27 @@
+From 047281c2f5e743c919ad97d72bf83c11046a209d Mon Sep 17 00:00:00 2001
+From: Victor Fuentes <victor@vlinkz.dev>
+Date: Sat, 26 Sep 2026 15:18:13 -0700
+Subject: [PATCH 01/14] arm: Allow boards to set LNX_KRNL_IMG_TEXT_OFFSET_BASE
+
+The option has no prompt, so a defconfig can't override the SoC
+default. Some Qualcomm bootloaders honour the image header's
+text_offset and need it to be 0 for a position independent U-Boot.
+
+Signed-off-by: Victor Fuentes <victor@vlinkz.dev>
+---
+ arch/arm/Kconfig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index 1b474a346..7e85c4d64 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -103,7 +103,7 @@ config LINUX_KERNEL_IMAGE_HEADER
+ 
+ config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+ 	depends on LINUX_KERNEL_IMAGE_HEADER
+-	hex
++	hex "Linux kernel image TEXT_OFFSET base"
+ 	help
+ 	  The value subtracted from CONFIG_TEXT_BASE to calculate the
+ 	  TEXT_OFFSET value written to the Linux kernel image header.

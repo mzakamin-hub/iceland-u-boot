@@ -1,0 +1,28 @@
+From 7b2fc463401030c67fdae62a8bcc05eabdd012fe Mon Sep 17 00:00:00 2001
+From: Victor Fuentes <victor@vlinkz.dev>
+Date: Sun, 27 Sep 2026 01:31:49 -0700
+Subject: [PATCH 03/14] usb: gadget: f_fastboot: Only dequeue the IN request
+ while it is queued
+
+Dequeueing a request that is not queued makes DWC3 complain for each
+response, which breaks "fastboot oem console".
+
+Signed-off-by: Victor Fuentes <victor@vlinkz.dev>
+---
+ drivers/usb/gadget/f_fastboot.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/gadget/f_fastboot.c b/drivers/usb/gadget/f_fastboot.c
+index 8df0e3f33..e2340164e 100644
+--- a/drivers/usb/gadget/f_fastboot.c
++++ b/drivers/usb/gadget/f_fastboot.c
+@@ -406,7 +406,8 @@ static int fastboot_tx_write(const char *buffer, unsigned int buffer_size)
+ 	memcpy(in_req->buf, buffer, buffer_size);
+ 	in_req->length = buffer_size;
+ 
+-	usb_ep_dequeue(fastboot_func->in_ep, in_req);
++	if (in_req->status == -EINPROGRESS)
++		usb_ep_dequeue(fastboot_func->in_ep, in_req);
+ 
+ 	ret = usb_ep_queue(fastboot_func->in_ep, in_req, 0);
+ 	if (ret)
