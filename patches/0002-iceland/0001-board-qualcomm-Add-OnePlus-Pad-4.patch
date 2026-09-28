@@ -1,4 +1,4 @@
-From ea918e5b63712711089effd7b5f238069342c9ae Mon Sep 17 00:00:00 2001
+From aea774d436a5eebee10dcb64223681c94f939e75 Mon Sep 17 00:00:00 2001
 From: mzak <mzak.amin@gmail.com>
 Date: Mon, 28 Sep 2026 00:40:31 +0000
 Subject: [PATCH] board: qualcomm: Add OnePlus Pad 4
@@ -15,20 +15,20 @@ DT on the ESP (fdtfile) for the EFI boot manager.
 
 Signed-off-by: mzak <mzak.amin@gmail.com>
 ---
- arch/arm/dts/kaanapali-oneplus-iceland.dts | 249 +++++++++++++++++++++
+ arch/arm/dts/kaanapali-oneplus-iceland.dts | 256 +++++++++++++++++++++
  board/qualcomm/iceland.env                 |   8 +
  configs/iceland_defconfig                  |  24 ++
- 3 files changed, 281 insertions(+)
+ 3 files changed, 288 insertions(+)
  create mode 100644 arch/arm/dts/kaanapali-oneplus-iceland.dts
  create mode 100644 board/qualcomm/iceland.env
  create mode 100644 configs/iceland_defconfig
 
 diff --git a/arch/arm/dts/kaanapali-oneplus-iceland.dts b/arch/arm/dts/kaanapali-oneplus-iceland.dts
 new file mode 100644
-index 000000000..496557f4c
+index 000000000..87c3b077e
 --- /dev/null
 +++ b/arch/arm/dts/kaanapali-oneplus-iceland.dts
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,256 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Minimal DT for U-Boot on the OnePlus Pad 4: RAM, UFS, USB for fastboot,
@@ -50,6 +50,13 @@ index 000000000..496557f4c
 +
 +	model = "OnePlus Pad 4";
 +	compatible = "oneplus,iceland", "qcom,kaanapali";
++
++	/*
++	 * Only used when ABL picks the DT from a header v2 boot image: ABL matches
++	 * these against the SoC (SM8850P 0x295 rev 2.0) and board (8) like the stock DT.
++	 */
++	qcom,msm-id = <0x295 0x20000>;
++	qcom,board-id = <0x08 0x00>;
 +
 +	chosen {
 +		#address-cells = <2>;

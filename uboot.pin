@@ -8,7 +8,7 @@ INFINITI_URL=https://github.com/infiniti-mainline/u-boot
 INFINITI_COMMIT=bce42004f0758b477e5bb1affcf38592fe3c4a23
 TREE_AFTER_0001_infiniti=578741d3a7e31d8dbd7b26fb6ec606ef6ca70dab
 # 0002-iceland = OnePlus Pad 4 board:
-TREE_AFTER_0002_iceland=a7d9b489bb2ee1c8c0277d0bc6b7b44baef188e7
+TREE_AFTER_0002_iceland=35ea17beebd6d63da538bb5d329e301906638c2a
 
 # AOSP mkbootimg (Apache-2.0), LineageOS mirror, fetched at build time (not vendored)
 MKBOOTIMG_URL=https://github.com/LineageOS/android_system_tools_mkbootimg
