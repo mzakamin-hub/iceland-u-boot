@@ -1,0 +1,35 @@
+From 30ea0be343d5ec862a19b1bf0dc24002dbd21821 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Tue, 29 Sep 2026 03:52:52 +0000
+Subject: [PATCH] board: qualcomm: iceland: Boot Fedora from a "fedora"
+ partition when there is one
+
+For dual boot (Android + Fedora), Fedora gets its own GPT partition named
+"fedora", carved from userdata, and Android keeps the rest. Map that
+partition read-only with blkmap when it exists, otherwise fall back to the
+single-boot layout (the Fedora disk in userdata). U-Boot still never
+writes the UFS.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ board/qualcomm/iceland.env | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/board/qualcomm/iceland.env b/board/qualcomm/iceland.env
+index 0a38d8160..644752595 100644
+--- a/board/qualcomm/iceland.env
++++ b/board/qualcomm/iceland.env
+@@ -5,4 +5,9 @@ bootdelay=0
+ # Linux DT loaded from the ESP by the EFI boot manager (dtb/<fdtfile>)
+ fdtfile=qcom/kaanapali-oneplus-iceland.dtb
+ userdata_blkmap=scsi scan && part start scsi 0 userdata ud_start && part size scsi 0 userdata ud_size && blkmap create userdata && blkmap map userdata 0 ${ud_size} linear scsi 0 ${ud_start}
+-bootcmd=run userdata_blkmap; bootefi bootmgr; fastboot usb 0
++# Dual boot (Android + Fedora): Fedora lives in its own GPT partition named "fedora", carved from userdata;
++# Android keeps the rest. Read-only like userdata_blkmap: U-Boot never writes the UFS.
++fedora_blkmap=scsi scan && part start scsi 0 fedora fd_start && part size scsi 0 fedora fd_size && blkmap create fedora && blkmap map fedora 0 ${fd_size} linear scsi 0 ${fd_start}
++# One boot command for both layouts: a "fedora" partition wins (dual boot); otherwise userdata holds the
++# Fedora disk (single boot). If nothing boots, fall back to fastboot (RAM boot only; flashing is compiled out).
++bootcmd=if run fedora_blkmap; then echo "booting Fedora from the fedora partition"; else run userdata_blkmap; fi; bootefi bootmgr; fastboot usb 0
+-- 
+2.43.0
+
