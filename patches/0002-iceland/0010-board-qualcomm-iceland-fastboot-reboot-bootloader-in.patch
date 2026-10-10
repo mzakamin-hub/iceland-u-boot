@@ -1,0 +1,330 @@
+From 09ef370367cc9ce68210d2d75d8e13ee32f80f80 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Sat, 10 Oct 2026 17:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: fastboot reboot-bootloader into
+ ABL's fastboot
+
+From U-Boot started by ABL from boot_b (C0 #3), the only way back to
+ABL's fastboot was the owner's Volume Down + Power, and every reset
+U-Boot did was a normal boot of slot b that ABL counted down (7 -> 2
+in one exit).
+
+ABL reads the reboot reason from the PMK8850 SDAM 2 byte 0x48, bits
+1-7: 2 = bootloader (Linux pmk8850.dtsi nvmem-reboot-mode; stock's
+qcom,reboot-reason uses the same cell for `reboot bootloader`). With
+that value it stays in its fastboot and boots no slot.
+
+- misc: qcom-spmi-sdam: the SDAM memory bytes as a misc / nvmem
+  device (port of Linux's qcom-spmi-sdam; size from SDAM_SIZE, the
+  id / size registers read only, never the PBS trigger registers).
+- mach-snapdragon: fastboot_set_reboot_flag() for the bootloader
+  reason: store the DT's mode-bootloader in the nvmem-reboot-mode
+  cell (read, modify the bit field, write, read back). Without the
+  node, or if the byte does not read back, `reboot-bootloader` fails
+  and nothing is reset (as before: the weak default needs a misc
+  partition writer, which this board does not have).
+- DT: the SDAM 2 node with the reboot-reason cell and the
+  reboot-mode node, as Linux.
+
+U-Boot still never resets by itself: the reset happens only after the
+PC's `fastboot reboot-bootloader` was answered OKAY.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ arch/arm/dts/kaanapali-oneplus-iceland.dts |  22 +++++
+ arch/arm/mach-snapdragon/Makefile          |   1 +
+ arch/arm/mach-snapdragon/fastboot.c        |  72 ++++++++++++++
+ configs/iceland_defconfig                  |   1 +
+ drivers/misc/Kconfig                       |   7 ++
+ drivers/misc/Makefile                      |   1 +
+ drivers/misc/qcom-spmi-sdam.c              | 109 +++++++++++++++++++++
+ 7 files changed, 213 insertions(+)
+ create mode 100755 arch/arm/mach-snapdragon/fastboot.c
+ create mode 100755 drivers/misc/qcom-spmi-sdam.c
+
+diff --git a/arch/arm/dts/kaanapali-oneplus-iceland.dts b/arch/arm/dts/kaanapali-oneplus-iceland.dts
+index 13a95011..a785f1ca 100644
+--- a/arch/arm/dts/kaanapali-oneplus-iceland.dts
++++ b/arch/arm/dts/kaanapali-oneplus-iceland.dts
+@@ -100,6 +100,15 @@
+ 		method = "smc";
+ 	};
+ 
++	/* as pmk8850.dtsi in Linux (stock: qcom,reboot-reason on the same cell) */
++	reboot-mode {
++		compatible = "nvmem-reboot-mode";
++		nvmem-cells = <&reboot_reason>;
++		nvmem-cell-names = "reboot-mode";
++		mode-recovery = <0x01>;
++		mode-bootloader = <0x02>;
++	};
++
+ 	soc@0 {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;
+@@ -248,6 +257,19 @@
+ 							linux,code = <KEY_VOLUMEUP>;
+ 						};
+ 					};
++
++					nvram@7100 {
++						compatible = "qcom,spmi-sdam";
++						reg = <0x7100>;
++						#address-cells = <1>;
++						#size-cells = <1>;
++						ranges = <0 0x7100 0x100>;
++
++						reboot_reason: reboot-reason@48 {
++							reg = <0x48 0x1>;
++							bits = <1 7>;
++						};
++					};
+ 				};
+ 
+ 				pmic@1 {
+diff --git a/arch/arm/mach-snapdragon/Makefile b/arch/arm/mach-snapdragon/Makefile
+index 343e825c..ec720058 100644
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -3,5 +3,6 @@
+ # (C) Copyright 2015 Mateusz Kulikowski <mateusz.kulikowski@gmail.com>
+ 
+ obj-y += board.o
++obj-$(CONFIG_FASTBOOT) += fastboot.o
+ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ obj-$(CONFIG_OF_LIVE) += of_fixup.o
+diff --git a/arch/arm/mach-snapdragon/fastboot.c b/arch/arm/mach-snapdragon/fastboot.c
+new file mode 100755
+index 00000000..25afdd72
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/fastboot.c
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * `fastboot reboot-bootloader` on Qualcomm boards: before fastboot resets,
++ * store the DT's reboot mode for "bootloader" in the nvmem cell of its
++ * nvmem-reboot-mode node (on recent SoCs a PMIC SDAM byte, bits 1-7), as
++ * Linux's nvmem-reboot-mode driver does for `reboot bootloader`. The boot
++ * loader that runs after the reset (ABL) reads it and stays in its fastboot
++ * instead of booting a slot. Without such a node, or if the byte cannot be
++ * written and read back, the command fails and nothing is reset.
++ */
++
++#include <dm.h>
++#include <fastboot.h>
++#include <misc.h>
++#include <linux/bitops.h>
++#include <dm/ofnode.h>
++
++static int qcom_reboot_mode_store(const char *mode_prop)
++{
++	ofnode node = ofnode_by_compatible(ofnode_null(), "nvmem-reboot-mode");
++	struct ofnode_phandle_args args;
++	u32 mode, reg[2], bits[2] = { 0, 8 };
++	struct udevice *nvmem;
++	u8 val, check, mask;
++	int ret;
++
++	if (!ofnode_valid(node) || ofnode_read_u32(node, mode_prop, &mode))
++		return -ENOENT;
++
++	ret = ofnode_parse_phandle_with_args(node, "nvmem-cells", NULL, 0, 0, &args);
++	if (ret)
++		return ret;
++
++	/* one byte, an optional bit field inside it ("bits" = <offset count>) */
++	if (ofnode_read_u32_array(args.node, "reg", reg, 2) || reg[1] != 1)
++		return -EINVAL;
++	ofnode_read_u32_array(args.node, "bits", bits, 2);
++	if (!bits[1] || bits[0] + bits[1] > 8)
++		return -EINVAL;
++	mask = GENMASK(bits[0] + bits[1] - 1, bits[0]);
++	if ((mode << bits[0]) & ~mask)
++		return -EINVAL;
++
++	ret = uclass_get_device_by_ofnode(UCLASS_MISC, ofnode_get_parent(args.node), &nvmem);
++	if (ret)
++		return ret;
++
++	ret = misc_read(nvmem, reg[0], &val, 1);
++	if (ret != 1)
++		return ret < 0 ? ret : -EIO;
++	val = (val & ~mask) | (mode << bits[0]);
++	ret = misc_write(nvmem, reg[0], &val, 1);
++	if (ret != 1)
++		return ret < 0 ? ret : -EIO;
++	ret = misc_read(nvmem, reg[0], &check, 1);
++	if (ret != 1)
++		return ret < 0 ? ret : -EIO;
++	if ((check & mask) != (mode << bits[0]))
++		return -EIO;
++
++	printf("reboot mode %s = %u stored (cell %#x: %#04x)\n", mode_prop, mode, reg[0], check);
++
++	return 0;
++}
++
++int fastboot_set_reboot_flag(enum fastboot_reboot_reason reason)
++{
++	if (reason != FASTBOOT_REBOOT_REASON_BOOTLOADER)
++		return -EINVAL;
++
++	return qcom_reboot_mode_store("mode-bootloader");
++}
+diff --git a/configs/iceland_defconfig b/configs/iceland_defconfig
+index 5158d389..c3060885 100644
+--- a/configs/iceland_defconfig
++++ b/configs/iceland_defconfig
+@@ -8,6 +8,7 @@ CONFIG_ENV_RELOC_GD_ENV_ADDR=y
+ CONFIG_LNX_KRNL_IMG_TEXT_OFFSET_BASE=0x0
+ CONFIG_PHY_QCOM_M31_EUSB2=y
+ CONFIG_PHY_QCOM_EUSB2_REPEATER=y
++CONFIG_QCOM_SPMI_SDAM=y
+ # CONFIG_QCOM_RPMH_POWER_DOMAIN is not set
+ CONFIG_USB_FUNCTION_FASTBOOT=y
+ # 1 GiB download buffer in the 9 GiB RAM bank (a rehearsal head is a few hundred MB of gzip)
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 44415f24..f610d9fd 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -83,6 +83,13 @@ config GATEWORKS_SC
+ 	  boards to provide a boot watchdog, power control, temperature monitor,
+ 	  voltage ADCs, and EEPROM.
+ 
++config QCOM_SPMI_SDAM
++	bool "Qualcomm PMIC SDAM (Shared Direct Access Memory)"
++	depends on MISC && PMIC_QCOM
++	help
++	  Access to the memory bytes of a Qualcomm PMIC SDAM block as a misc
++	  (nvmem) device, e.g. for the reboot mode the boot loader reads.
++
+ config QCOM_GENI
+ 	bool "Qualcomm Generic Interface (GENI) driver"
+ 	depends on MISC
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index e2170212..461beaa1 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -92,3 +92,4 @@ obj-$(CONFIG_K3_BIST) += k3_bist.o
+ obj-$(CONFIG_ESM_PMIC) += esm_pmic.o
+ obj-$(CONFIG_SL28CPLD) += sl28cpld.o
+ obj-$(CONFIG_SPL_SOCFPGA_DT_REG) += socfpga_dtreg.o
++obj-$(CONFIG_QCOM_SPMI_SDAM) += qcom-spmi-sdam.o
+diff --git a/drivers/misc/qcom-spmi-sdam.c b/drivers/misc/qcom-spmi-sdam.c
+new file mode 100755
+index 00000000..a22be84f
+--- /dev/null
++++ b/drivers/misc/qcom-spmi-sdam.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Qualcomm PMIC SDAM (Shared Direct Access Memory) as a misc / nvmem device,
++ * based on the Linux driver (drivers/nvmem/qcom-spmi-sdam.c). Gives access to
++ * the SDAM's memory bytes only (from 0x40, SDAM_SIZE * 32 bytes); unlike Linux
++ * it never writes the PBS trigger registers.
++ *
++ * Copyright (c) 2017, 2020-2021, The Linux Foundation. All rights reserved.
++ */
++
++#include <dm.h>
++#include <dm/device_compat.h>
++#include <misc.h>
++#include <power/pmic.h>
++
++#define SDAM_MEM_START			0x40
++#define SDAM_SIZE			0x44
++
++struct sdam_priv {
++	struct udevice *pmic;
++	u32 base;
++	u32 size;
++};
++
++static bool sdam_is_valid(struct sdam_priv *priv, int offset, int len)
++{
++	return len > 0 && offset >= SDAM_MEM_START &&
++	       offset + len <= SDAM_MEM_START + priv->size;
++}
++
++static int sdam_read(struct udevice *dev, int offset, void *buf, int size)
++{
++	struct sdam_priv *priv = dev_get_priv(dev);
++	u8 *b = buf;
++	int i, ret;
++
++	if (!sdam_is_valid(priv, offset, size))
++		return -EINVAL;
++
++	for (i = 0; i < size; i++) {
++		ret = pmic_reg_read(priv->pmic, priv->base + offset + i);
++		if (ret < 0)
++			return ret;
++		b[i] = ret;
++	}
++
++	return size;
++}
++
++static int sdam_write(struct udevice *dev, int offset, const void *buf,
++		      int size)
++{
++	struct sdam_priv *priv = dev_get_priv(dev);
++	const u8 *b = buf;
++	int i, ret;
++
++	/* the register map id / version and SDAM_SIZE (0x40-0x44) are read only */
++	if (!sdam_is_valid(priv, offset, size) ||
++	    (offset <= SDAM_SIZE && offset + size > 0x40))
++		return -EINVAL;
++
++	for (i = 0; i < size; i++) {
++		ret = pmic_reg_write(priv->pmic, priv->base + offset + i, b[i]);
++		if (ret)
++			return ret;
++	}
++
++	return size;
++}
++
++static const struct misc_ops sdam_ops = {
++	.read = sdam_read,
++	.write = sdam_write,
++};
++
++static int sdam_probe(struct udevice *dev)
++{
++	struct sdam_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	priv->pmic = dev_get_parent(dev);
++
++	ret = dev_read_u32(dev, "reg", &priv->base);
++	if (ret)
++		return ret;
++
++	ret = pmic_reg_read(priv->pmic, priv->base + SDAM_SIZE);
++	if (ret < 0)
++		return ret;
++	priv->size = ret * 32;
++	if (!priv->size)
++		return -ENODEV;
++
++	return 0;
++}
++
++static const struct udevice_id sdam_ids[] = {
++	{ .compatible = "qcom,spmi-sdam" },
++	{ }
++};
++
++U_BOOT_DRIVER(qcom_spmi_sdam) = {
++	.name = "qcom-spmi-sdam",
++	.id = UCLASS_MISC,
++	.of_match = sdam_ids,
++	.ops = &sdam_ops,
++	.probe = sdam_probe,
++	.priv_auto = sizeof(struct sdam_priv),
++};
+-- 
+2.43.0
+

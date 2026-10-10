@@ -1,0 +1,3 @@
+979b40767afba37367354cfe047994acff10b21831f7664933ee30c7dc89f94c  u-boot-iceland-usb.img
+8a1b011cea5d16a82ca96eb3964b222300f8509f6bbd7962f073f6d938c3c096  u-boot-iceland-rehearsal-usb.img
+778e979cbdbb51293b5b6a316e79acd1c7e564563a7eb4fe3f9c7a32a53e6dc8  u-boot-iceland-usbcold.img

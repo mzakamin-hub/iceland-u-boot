@@ -1,0 +1,137 @@
+From 415dad0273951a1dbecd986dc3b8b7548044c3aa Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Fri, 2 Oct 2026 12:00:00 +0000
+Subject: [PATCH 3/4] board: qualcomm: iceland: The install environment
+
+The U-Boot that is written to the boot partition boots Fedora from the
+disk image in userdata (unchanged) and keeps U-Boot's fastboot as the
+fallback for the PC. Make that fallback start what the PC sends with
+`fastboot boot`:
+- an Android boot image: the RAM test / rescue kit, through the kernel's
+  EFI stub, as the diagnostic U-Boot "L" used in every test so far;
+- a gzip file: a rehearsal head of the install image, unpacked into RAM,
+  mapped as a disk with the UFS's 4096-byte blocks and booted with the EFI
+  boot manager, so the image that will be written is rehearsed through
+  the same path first.
+No key check before autoboot (bootdelay=-2): there is no keyboard, and a
+U-Boot shell is never needed. A 1 GiB download buffer in the large RAM
+bank; ABL's USB product ID so the PC's driver binds as in the tests; EFI
+programs may write only the blkmap disks.
+
+The rehearsal from RAM must not touch userdata at all: the three lines
+that reach the UFS are marked ICELAND_INSTALL_ONLY, and
+iceland-rehearsal.env is the same environment without them (its
+bootcmd only starts fastboot). A fastboot session that ends without a
+boot starts fastboot again (10 times, then reset), and every path of the
+fastboot boot command says what failed, so neither build ever stops at a
+U-Boot prompt that nobody can answer. The rehearsal build selects that file
+and is built without SCSI / UFS support.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ board/qualcomm/iceland-rehearsal.env | 18 ++++++++++++++++++
+ board/qualcomm/iceland.env           | 33 +++++++++++++++++++++++++++++++--
+ configs/iceland_defconfig            | 10 ++++++++--
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/board/qualcomm/iceland-rehearsal.env b/board/qualcomm/iceland-rehearsal.env
+new file mode 100644
+index 0000000..0a23a39
+--- /dev/null
++++ b/board/qualcomm/iceland-rehearsal.env
+@@ -0,0 +1,18 @@
++# OnePlus Pad 4, the REHEARSAL build of U-Boot: iceland.env without the lines marked ICELAND_INSTALL_ONLY.
++# It never maps a partition of the UFS (no partition lookup on the UFS at all); this build has
++# no SCSI / UFS driver either (mk-uboot.sh). It waits in fastboot for the PC's rehearsal head or kit image.
++stdin=serial,button-kbd
++stdout=serial,vidconsole
++stderr=serial,vidconsole
++bootdelay=-2
++fdtfile=qcom/kaanapali-oneplus-iceland.dtb
++fbaddr=0x980000000
++headaddr=0x8c0000000
++headmax=0xc0000000
++kit_bootargs=console=tty0 log_buf_len=4M earlycon=efifb keep_bootcon ignore_loglevel loglevel=8 clk_ignore_unused pd_ignore_unused regulator_ignore_unused rdinit=/init efi=debug
++fastboot_android=setexpr a ${fbaddr} + 8; setexpr.l ksz *${a}; setexpr a ${fbaddr} + 0x10; setexpr.l rsz *${a}; setexpr kaddr ${fbaddr} + 0x1000; setexpr pad ${ksz} + 0xfff; setexpr pad ${pad} / 0x1000; setexpr pad ${pad} * 0x1000; setexpr raddr ${kaddr} + ${pad}; setexpr pad ${rsz} + 0xfff; setexpr pad ${pad} / 0x1000; setexpr pad ${pad} * 0x1000; setexpr daddr ${raddr} + ${pad}; setenv bootargs ${kit_bootargs}; echo === EFI boot: kernel ${kaddr}:${ksz} initrd ${raddr}:${rsz} dtb ${daddr} ===; bootefi ${kaddr}:${ksz} ${raddr}:${rsz} ${daddr}; echo === kit image FAILED: the kernel returned to U-Boot - back to fastboot ===
++fastboot_head=setexpr hsrc ${fbaddr} + 0x1000; setenv hfail; echo === rehearsal head: unpacking ===; if itest.w *${hsrc} != 0x8b1f; then setenv hfail "the head is not gzip"; elif unzip ${hsrc} ${headaddr} ${headmax}; then setexpr hblk ${filesize} / 0x1000; if blkmap create rehearsal 4096; then if blkmap map rehearsal 0 ${hblk} mem ${headaddr} reserve; then echo === rehearsal head: ${hblk} blocks of 4096 bytes, EFI boot manager ===; blkmap get rehearsal dev bdev; run fedora_bootopt; bootefi bootmgr; setenv hfail "the EFI boot manager returned (nothing bootable on the head)"; else setenv hfail "blkmap map of ${hblk} blocks at ${headaddr}"; fi; else setenv hfail "blkmap create"; fi; else setenv hfail "unzip to ${headaddr}"; fi; echo === rehearsal head FAILED: ${hfail} - back to fastboot ===
++fastboot_bootcmd=setexpr a ${fbaddr} + 0x30; if itest.l *${fbaddr} != 0x52444e41; then echo === fastboot boot FAILED: not an Android boot image - back to fastboot ===; elif itest.l *${a} == 0x6c656369; then run fastboot_head; else run fastboot_android; fi
++fastboot_loop=setenv fastboot_idle_timeout 600; for n in 1 2 3 4 5 6 7 8 9 10; do if fastboot usb 0; then echo === fastboot session ${n} ended without a boot: fastboot again ===; else echo === no fastboot command for 10 minutes or no USB: power off ===; sleep 5; poweroff; fi; sleep 1; done; echo === no boot after 10 fastboot sessions: power off in 10 s ===; sleep 10; poweroff
++fedora_bootopt=if test -n "${bdev}"; then efidebug boot add -b 1 Fedora blkmap ${bdev}:1 /EFI/fedora/shimaa64.efi && efidebug boot order 1 && echo === EFI boot option 1: shim on blkmap ${bdev}:1 ===; fi
++bootcmd=run fastboot_loop
+diff --git a/board/qualcomm/iceland.env b/board/qualcomm/iceland.env
+index 6447525..969f0c1 100644
+--- a/board/qualcomm/iceland.env
++++ b/board/qualcomm/iceland.env
+@@ -1,13 +1,42 @@
+ stdin=serial,button-kbd
+ stdout=serial,vidconsole
+ stderr=serial,vidconsole
+-bootdelay=0
++# No key check at all: nothing can stop the boot in a U-Boot shell (the buttons are the only keyboard).
++bootdelay=-2
+ # Linux DT loaded from the ESP by the EFI boot manager (dtb/<fdtfile>)
+ fdtfile=qcom/kaanapali-oneplus-iceland.dtb
++# ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ userdata_blkmap=scsi scan && part start scsi 0 userdata ud_start && part size scsi 0 userdata ud_size && blkmap create userdata && blkmap map userdata 0 ${ud_size} linear scsi 0 ${ud_start}
++# `fastboot boot FILE` (U-Boot's fastboot is reached when nothing boots; it cannot write the storage):
++#  - an Android boot image (header v2: kernel, ramdisk, DT): the RAM rescue / test kit, started through the
++#    kernel's EFI stub with kit_bootargs (as the daily diagnostic U-Boot "L" does);
++#  - a boot image named "iceland-head" (name field at 0x30): its kernel is a gzip'd rehearsal head of the install
++#    image (mk-head.py), unpacked to headaddr, mapped as a RAM disk with the 4096-byte blocks of the UFS, its
++#    memory reserved, and started with the EFI boot manager - the same path as the disk inside userdata.
++#    (Wrapped as a boot image because the PC's `fastboot boot` wraps any other file into one.)
++#    Anything that is not a boot image is refused.
++fbaddr=0x980000000
++headaddr=0x8c0000000
++headmax=0xc0000000
++kit_bootargs=console=tty0 log_buf_len=4M earlycon=efifb keep_bootcon ignore_loglevel loglevel=8 clk_ignore_unused pd_ignore_unused regulator_ignore_unused rdinit=/init efi=debug
++fastboot_android=setexpr a ${fbaddr} + 8; setexpr.l ksz *${a}; setexpr a ${fbaddr} + 0x10; setexpr.l rsz *${a}; setexpr kaddr ${fbaddr} + 0x1000; setexpr pad ${ksz} + 0xfff; setexpr pad ${pad} / 0x1000; setexpr pad ${pad} * 0x1000; setexpr raddr ${kaddr} + ${pad}; setexpr pad ${rsz} + 0xfff; setexpr pad ${pad} / 0x1000; setexpr pad ${pad} * 0x1000; setexpr daddr ${raddr} + ${pad}; setenv bootargs ${kit_bootargs}; echo === EFI boot: kernel ${kaddr}:${ksz} initrd ${raddr}:${rsz} dtb ${daddr} ===; bootefi ${kaddr}:${ksz} ${raddr}:${rsz} ${daddr}; echo === kit image FAILED: the kernel returned to U-Boot - back to fastboot ===
++fastboot_head=setexpr hsrc ${fbaddr} + 0x1000; setenv hfail; echo === rehearsal head: unpacking ===; if itest.w *${hsrc} != 0x8b1f; then setenv hfail "the head is not gzip"; elif unzip ${hsrc} ${headaddr} ${headmax}; then setexpr hblk ${filesize} / 0x1000; if blkmap create rehearsal 4096; then if blkmap map rehearsal 0 ${hblk} mem ${headaddr} reserve; then echo === rehearsal head: ${hblk} blocks of 4096 bytes, EFI boot manager ===; blkmap get rehearsal dev bdev; run fedora_bootopt; bootefi bootmgr; setenv hfail "the EFI boot manager returned (nothing bootable on the head)"; else setenv hfail "blkmap map of ${hblk} blocks at ${headaddr}"; fi; else setenv hfail "blkmap create"; fi; else setenv hfail "unzip to ${headaddr}"; fi; echo === rehearsal head FAILED: ${hfail} - back to fastboot ===
++fastboot_bootcmd=setexpr a ${fbaddr} + 0x30; if itest.l *${fbaddr} != 0x52444e41; then echo === fastboot boot FAILED: not an Android boot image - back to fastboot ===; elif itest.l *${a} == 0x6c656369; then run fastboot_head; else run fastboot_android; fi
++# Never a U-Boot prompt: when a fastboot session ends without a boot (`fastboot boot` of something that fails,
++# `fastboot continue`), fastboot starts again, so the PC can read `fastboot oem console` and `fastboot reboot`.
++# Without a PC it does not wait forever with the screen on: fastboot leaves after 10 minutes without a command
++# (fastboot_idle_timeout, patch "cmd: fastboot: Leave after an idle timeout") and U-Boot powers the tablet off;
++# the same after 10 sessions or if fastboot cannot start. The power key starts it again (ABL, then U-Boot).
++fastboot_loop=setenv fastboot_idle_timeout 600; for n in 1 2 3 4 5 6 7 8 9 10; do if fastboot usb 0; then echo === fastboot session ${n} ended without a boot: fastboot again ===; else echo === no fastboot command for 10 minutes or no USB: power off ===; sleep 5; poweroff; fi; sleep 1; done; echo === no boot after 10 fastboot sessions: power off in 10 s ===; sleep 10; poweroff
++# The EFI boot option for shim on the Fedora disk (blkmap device ${bdev}, partition 1 = the EFI system partition),
++# first in the boot order: the boot manager starts shim from it directly - not EFI/BOOT/BOOTAA64.EFI of whatever
++# disk it scans first, and not shim's fallback path
++fedora_bootopt=if test -n "${bdev}"; then efidebug boot add -b 1 Fedora blkmap ${bdev}:1 /EFI/fedora/shimaa64.efi && efidebug boot order 1 && echo === EFI boot option 1: shim on blkmap ${bdev}:1 ===; fi
+ # Dual boot (Android + Fedora): Fedora lives in its own GPT partition named "fedora", carved from userdata;
+ # Android keeps the rest. Read-only like userdata_blkmap: U-Boot never writes the UFS.
++# ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ fedora_blkmap=scsi scan && part start scsi 0 fedora fd_start && part size scsi 0 fedora fd_size && blkmap create fedora && blkmap map fedora 0 ${fd_size} linear scsi 0 ${fd_start}
+ # One boot command for both layouts: a "fedora" partition wins (dual boot); otherwise userdata holds the
+ # Fedora disk (single boot). If nothing boots, fall back to fastboot (RAM boot only; flashing is compiled out).
+-bootcmd=if run fedora_blkmap; then echo "booting Fedora from the fedora partition"; else run userdata_blkmap; fi; bootefi bootmgr; fastboot usb 0
++# ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
++bootcmd=if run fedora_blkmap; then echo "booting Fedora from the fedora partition"; else run userdata_blkmap; fi; if blkmap get fedora dev bdev; then true; else blkmap get userdata dev bdev; fi; run fedora_bootopt; bootefi bootmgr; run fastboot_loop
+diff --git a/configs/iceland_defconfig b/configs/iceland_defconfig
+index e13976a..52f7fc0 100644
+--- a/configs/iceland_defconfig
++++ b/configs/iceland_defconfig
+@@ -9,8 +9,9 @@ CONFIG_LNX_KRNL_IMG_TEXT_OFFSET_BASE=0x0
+ CONFIG_PHY_QCOM_M31_EUSB2=y
+ # CONFIG_QCOM_RPMH_POWER_DOMAIN is not set
+ CONFIG_USB_FUNCTION_FASTBOOT=y
+-CONFIG_FASTBOOT_BUF_ADDR=0xc6000000
+-CONFIG_FASTBOOT_BUF_SIZE=0x10000000
++# 1 GiB download buffer in the 9 GiB RAM bank (a rehearsal head is a few hundred MB of gzip)
++CONFIG_FASTBOOT_BUF_ADDR=0x980000000
++CONFIG_FASTBOOT_BUF_SIZE=0x40000000
+ CONFIG_VIDEO=y
+ CONFIG_VIDEO_SIMPLE=y
+ # CONFIG_VIDEO_FONT_8X16 is not set
+@@ -28,3 +29,8 @@ CONFIG_EFI_VARIABLE_NO_STORE=y
+ CONFIG_CONSOLE_RECORD=y
+ CONFIG_CONSOLE_RECORD_OUT_SIZE=0x20000
+ CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y
++# Install image: the USB product ID of ABL's fastboot (the PC's driver binds as in every test), unzip for the
++# rehearsal head, and EFI programs can write nothing but the blkmap disks (the Fedora disk, the rehearsal head)
++CONFIG_USB_GADGET_PRODUCT_NUM=0xd00d
++CONFIG_CMD_UNZIP=y
++CONFIG_EFI_DISK_WRITE_BLKMAP_ONLY=y
+-- 
+2.43.0
+

@@ -7,8 +7,9 @@ UPSTREAM_COMMIT=a06e89ab05eaa2b8344d521319399333cd760ae5
 INFINITI_URL=https://github.com/infiniti-mainline/u-boot
 INFINITI_COMMIT=bce42004f0758b477e5bb1affcf38592fe3c4a23
 TREE_AFTER_0001_infiniti=578741d3a7e31d8dbd7b26fb6ec606ef6ca70dab
-# 0002-iceland = OnePlus Pad 4 board:
-TREE_AFTER_0002_iceland=cce06382fcfcc5af77a84a1b9f0dbf31768d057a
+# 0002-iceland = OnePlus Pad 4 board (0001-0003) + the install build (0004-0010, proven on the tablet 10 Oct 2026;
+# the tree built and tested as v3, U-Boot commit aac9e744ec6f). Board only (0001-0003) was cce06382fcfc:
+TREE_AFTER_0002_iceland=158b0f7851ad8c18f87b8a3974abeae6021e02a3
 
 # AOSP mkbootimg (Apache-2.0), LineageOS mirror, fetched at build time (not vendored)
 MKBOOTIMG_URL=https://github.com/LineageOS/android_system_tools_mkbootimg

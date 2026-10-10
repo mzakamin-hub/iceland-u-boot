@@ -1,0 +1,102 @@
+From 8f3480efb1a52989f57d94b630a21c09d51a1be9 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Sat, 10 Oct 2026 12:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: Never reset or power off on a
+ failure
+
+Started by ABL from boot_b with no Fedora disk (install-day probe C0),
+the install build restarted the tablet again and again until ABL had
+counted slot b down to zero and marked it unbootable. Every way this
+U-Boot can leave by itself starts the slot again: a reset is a new
+boot, and a power off with the USB cable in is expected to power the
+tablet on again (ABL logs "not allow_kpoc": no power-off charging);
+each such boot counts the slot down.
+
+- fastboot_loop: when fastboot cannot start or sees no command for
+  fastboot_idle_timeout seconds, say so on the screen, wait 60 s and
+  start fastboot again, for ever; no poweroff any more. A line before
+  every start of fastboot shows on the screen how far U-Boot got.
+- CONFIG_PANIC_HANG: a panic or an exception stops with its message on
+  the screen instead of resetting.
+- One `scsi scan` per boot: fedora_blkmap scans, userdata_blkmap only
+  looks up its partition (the second scan was never run on the tablet).
+- fedora_bootopt: only when the mapped disk has a partition 1; else one
+  line instead of efidebug's usage text filling the screen.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ board/qualcomm/iceland-rehearsal.env |  5 +++--
+ board/qualcomm/iceland.env           | 20 +++++++++++++-------
+ configs/iceland_defconfig            |  3 +++
+ 3 files changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/board/qualcomm/iceland-rehearsal.env b/board/qualcomm/iceland-rehearsal.env
+index 0a23a395..d0533e65 100644
+--- a/board/qualcomm/iceland-rehearsal.env
++++ b/board/qualcomm/iceland-rehearsal.env
+@@ -13,6 +13,7 @@ kit_bootargs=console=tty0 log_buf_len=4M earlycon=efifb keep_bootcon ignore_logl
+ fastboot_android=setexpr a ${fbaddr} + 8; setexpr.l ksz *${a}; setexpr a ${fbaddr} + 0x10; setexpr.l rsz *${a}; setexpr kaddr ${fbaddr} + 0x1000; setexpr pad ${ksz} + 0xfff; setexpr pad ${pad} / 0x1000; setexpr pad ${pad} * 0x1000; setexpr raddr ${kaddr} + ${pad}; setexpr pad ${rsz} + 0xfff; setexpr pad ${pad} / 0x1000; setexpr pad ${pad} * 0x1000; setexpr daddr ${raddr} + ${pad}; setenv bootargs ${kit_bootargs}; echo === EFI boot: kernel ${kaddr}:${ksz} initrd ${raddr}:${rsz} dtb ${daddr} ===; bootefi ${kaddr}:${ksz} ${raddr}:${rsz} ${daddr}; echo === kit image FAILED: the kernel returned to U-Boot - back to fastboot ===
+ fastboot_head=setexpr hsrc ${fbaddr} + 0x1000; setenv hfail; echo === rehearsal head: unpacking ===; if itest.w *${hsrc} != 0x8b1f; then setenv hfail "the head is not gzip"; elif unzip ${hsrc} ${headaddr} ${headmax}; then setexpr hblk ${filesize} / 0x1000; if blkmap create rehearsal 4096; then if blkmap map rehearsal 0 ${hblk} mem ${headaddr} reserve; then echo === rehearsal head: ${hblk} blocks of 4096 bytes, EFI boot manager ===; blkmap get rehearsal dev bdev; run fedora_bootopt; bootefi bootmgr; setenv hfail "the EFI boot manager returned (nothing bootable on the head)"; else setenv hfail "blkmap map of ${hblk} blocks at ${headaddr}"; fi; else setenv hfail "blkmap create"; fi; else setenv hfail "unzip to ${headaddr}"; fi; echo === rehearsal head FAILED: ${hfail} - back to fastboot ===
+ fastboot_bootcmd=setexpr a ${fbaddr} + 0x30; if itest.l *${fbaddr} != 0x52444e41; then echo === fastboot boot FAILED: not an Android boot image - back to fastboot ===; elif itest.l *${a} == 0x6c656369; then run fastboot_head; else run fastboot_android; fi
+-fastboot_loop=setenv fastboot_idle_timeout 600; for n in 1 2 3 4 5 6 7 8 9 10; do if fastboot usb 0; then echo === fastboot session ${n} ended without a boot: fastboot again ===; else echo === no fastboot command for 10 minutes or no USB: power off ===; sleep 5; poweroff; fi; sleep 1; done; echo === no boot after 10 fastboot sessions: power off in 10 s ===; sleep 10; poweroff
+-fedora_bootopt=if test -n "${bdev}"; then efidebug boot add -b 1 Fedora blkmap ${bdev}:1 /EFI/fedora/shimaa64.efi && efidebug boot order 1 && echo === EFI boot option 1: shim on blkmap ${bdev}:1 ===; fi
++fastboot_loop=setenv fastboot_idle_timeout 600; setenv n 0; while true; do setexpr n ${n} + 1; echo === fastboot ${n}: starting U-Boot fastboot over USB ===; if fastboot usb 0; then echo === fastboot session ${n} ended without a boot: fastboot again ===; else run fastboot_hold; fi; sleep 1; done
++fastboot_hold=echo === HOLD ${n}: U-Boot fastboot did not start or had no command for 10 minutes. No power off and no reset (either starts this boot slot again and counts it down). Fastboot again in 60 s. To leave: hold Volume Down + Power. ===; sleep 60
++fedora_bootopt=if test -n "${bdev}" && part start blkmap ${bdev} 1 esp_start; then efidebug boot add -b 1 Fedora blkmap ${bdev}:1 /EFI/fedora/shimaa64.efi && efidebug boot order 1 && echo === EFI boot option 1: shim on blkmap ${bdev}:1 ===; else echo === no partition 1 on the mapped disk: no Fedora disk, no EFI boot option ===; fi
+ bootcmd=run fastboot_loop
+diff --git a/board/qualcomm/iceland.env b/board/qualcomm/iceland.env
+index 969f0c15..53bab1df 100644
+--- a/board/qualcomm/iceland.env
++++ b/board/qualcomm/iceland.env
+@@ -6,7 +6,7 @@ bootdelay=-2
+ # Linux DT loaded from the ESP by the EFI boot manager (dtb/<fdtfile>)
+ fdtfile=qcom/kaanapali-oneplus-iceland.dtb
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+-userdata_blkmap=scsi scan && part start scsi 0 userdata ud_start && part size scsi 0 userdata ud_size && blkmap create userdata && blkmap map userdata 0 ${ud_size} linear scsi 0 ${ud_start}
++userdata_blkmap=part start scsi 0 userdata ud_start && part size scsi 0 userdata ud_size && blkmap create userdata && blkmap map userdata 0 ${ud_size} linear scsi 0 ${ud_start}
+ # `fastboot boot FILE` (U-Boot's fastboot is reached when nothing boots; it cannot write the storage):
+ #  - an Android boot image (header v2: kernel, ramdisk, DT): the RAM rescue / test kit, started through the
+ #    kernel's EFI stub with kit_bootargs (as the daily diagnostic U-Boot "L" does);
+@@ -24,16 +24,22 @@ fastboot_head=setexpr hsrc ${fbaddr} + 0x1000; setenv hfail; echo === rehearsal
+ fastboot_bootcmd=setexpr a ${fbaddr} + 0x30; if itest.l *${fbaddr} != 0x52444e41; then echo === fastboot boot FAILED: not an Android boot image - back to fastboot ===; elif itest.l *${a} == 0x6c656369; then run fastboot_head; else run fastboot_android; fi
+ # Never a U-Boot prompt: when a fastboot session ends without a boot (`fastboot boot` of something that fails,
+ # `fastboot continue`), fastboot starts again, so the PC can read `fastboot oem console` and `fastboot reboot`.
+-# Without a PC it does not wait forever with the screen on: fastboot leaves after 10 minutes without a command
+-# (fastboot_idle_timeout, patch "cmd: fastboot: Leave after an idle timeout") and U-Boot powers the tablet off;
+-# the same after 10 sessions or if fastboot cannot start. The power key starts it again (ABL, then U-Boot).
+-fastboot_loop=setenv fastboot_idle_timeout 600; for n in 1 2 3 4 5 6 7 8 9 10; do if fastboot usb 0; then echo === fastboot session ${n} ended without a boot: fastboot again ===; else echo === no fastboot command for 10 minutes or no USB: power off ===; sleep 5; poweroff; fi; sleep 1; done; echo === no boot after 10 fastboot sessions: power off in 10 s ===; sleep 10; poweroff
++# U-Boot never resets or powers off by itself (patch "Never reset or power off on a failure"): started by ABL
++# from boot_b, every reset is a new boot that counts slot b down, and a power off with the USB cable in is
++# expected to power the tablet on again (ABL: no power-off charging); in C0 (10 Oct 2026) repeated restarts took
++# slot b from 7 tries to 0 within two minutes. When fastboot cannot start or sees no command for 10 minutes
++# (fastboot_idle_timeout), U-Boot says so on the screen, waits 60 s and starts fastboot again, for ever.
++# Volume Down + Power leaves to the boot loader's fastboot (that boot does not count a slot down).
++fastboot_loop=setenv fastboot_idle_timeout 600; setenv n 0; while true; do setexpr n ${n} + 1; echo === fastboot ${n}: starting U-Boot fastboot over USB ===; if fastboot usb 0; then echo === fastboot session ${n} ended without a boot: fastboot again ===; else run fastboot_hold; fi; sleep 1; done
++fastboot_hold=echo === HOLD ${n}: U-Boot fastboot did not start or had no command for 10 minutes. No power off and no reset (either starts this boot slot again and counts it down). Fastboot again in 60 s. To leave: hold Volume Down + Power. ===; sleep 60
+ # The EFI boot option for shim on the Fedora disk (blkmap device ${bdev}, partition 1 = the EFI system partition),
+ # first in the boot order: the boot manager starts shim from it directly - not EFI/BOOT/BOOTAA64.EFI of whatever
+-# disk it scans first, and not shim's fallback path
+-fedora_bootopt=if test -n "${bdev}"; then efidebug boot add -b 1 Fedora blkmap ${bdev}:1 /EFI/fedora/shimaa64.efi && efidebug boot order 1 && echo === EFI boot option 1: shim on blkmap ${bdev}:1 ===; fi
++# disk it scans first, and not shim's fallback path. Only when the mapped disk has a partition 1 (Android's
++# userdata has none: one line instead of efidebug's usage text filling the screen)
++fedora_bootopt=if test -n "${bdev}" && part start blkmap ${bdev} 1 esp_start; then efidebug boot add -b 1 Fedora blkmap ${bdev}:1 /EFI/fedora/shimaa64.efi && efidebug boot order 1 && echo === EFI boot option 1: shim on blkmap ${bdev}:1 ===; else echo === no partition 1 on the mapped disk: no Fedora disk, no EFI boot option ===; fi
+ # Dual boot (Android + Fedora): Fedora lives in its own GPT partition named "fedora", carved from userdata;
+ # Android keeps the rest. Read-only like userdata_blkmap: U-Boot never writes the UFS.
++# The one `scsi scan` of a boot is here; userdata_blkmap runs only after it (no second scan of the UFS).
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ fedora_blkmap=scsi scan && part start scsi 0 fedora fd_start && part size scsi 0 fedora fd_size && blkmap create fedora && blkmap map fedora 0 ${fd_size} linear scsi 0 ${fd_start}
+ # One boot command for both layouts: a "fedora" partition wins (dual boot); otherwise userdata holds the
+diff --git a/configs/iceland_defconfig b/configs/iceland_defconfig
+index 52f7fc0d..72069d30 100644
+--- a/configs/iceland_defconfig
++++ b/configs/iceland_defconfig
+@@ -34,3 +34,6 @@ CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y
+ CONFIG_USB_GADGET_PRODUCT_NUM=0xd00d
+ CONFIG_CMD_UNZIP=y
+ CONFIG_EFI_DISK_WRITE_BLKMAP_ONLY=y
++# A panic or an exception stops with its message on the screen instead of resetting: started from boot_b,
++# every reset is a new boot of the slot that counts it down (C0, 10 Oct 2026)
++CONFIG_PANIC_HANG=y
+-- 
+2.43.0
+

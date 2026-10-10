@@ -1,0 +1,116 @@
+From 442aa762d0591ced16691bf50617441f2dfd67ae Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Fri, 2 Oct 2026 12:00:00 +0000
+Subject: [PATCH 4/4] cmd: fastboot: Leave after an idle timeout
+
+`fastboot usb` waits for a host forever. On a tablet whose boot loader
+falls back to fastboot when nothing boots, that keeps the screen on until
+the battery is flat when no PC is connected.
+
+Let ${fastboot_idle_timeout} (seconds, 0 or unset: no timeout) end the
+command with a failure when neither a fastboot command nor a download
+chunk arrived for that long, so the board's script can power off. Every
+command and download chunk counts as activity (fastboot_last_command).
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ cmd/fastboot.c                | 10 ++++++++++
+ drivers/fastboot/fb_command.c |  6 ++++++
+ include/fastboot.h            |  7 +++++++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/cmd/fastboot.c b/cmd/fastboot.c
+index f3929f8..dd27196 100644
+--- a/cmd/fastboot.c
++++ b/cmd/fastboot.c
+@@ -8,6 +8,7 @@
+  */
+ #include <command.h>
+ #include <console.h>
++#include <env.h>
+ #include <g_dnl.h>
+ #include <fastboot.h>
+ #include <net.h>
+@@ -64,6 +65,7 @@ static int do_fastboot_usb(int argc, char *const argv[],
+ 	int controller_index;
+ 	char *usb_controller;
+ 	struct udevice *udc;
++	ulong idle_ms;
+ 	char *endp;
+ 	int ret;
+ 
+@@ -100,9 +102,17 @@ static int do_fastboot_usb(int argc, char *const argv[],
+ 		goto exit;
+ 	}
+ 
++	idle_ms = env_get_ulong("fastboot_idle_timeout", 10, 0) * 1000;
++	fastboot_last_command = get_timer(0);
+ 	while (1) {
+ 		if (g_dnl_detach())
+ 			break;
++		if (idle_ms && get_timer(fastboot_last_command) > idle_ms) {
++			printf("\rfastboot: no command for %lu s, leaving\n",
++			       idle_ms / 1000);
++			ret = CMD_RET_FAILURE;
++			goto exit;
++		}
+ 		if (IS_ENABLED(CONFIG_CMD_FASTBOOT_ABORT_KEYED)) {
+ 			if (tstc()) {
+ 				getchar();
+diff --git a/drivers/fastboot/fb_command.c b/drivers/fastboot/fb_command.c
+index 18d8698..027f0d9 100644
+--- a/drivers/fastboot/fb_command.c
++++ b/drivers/fastboot/fb_command.c
+@@ -14,6 +14,7 @@
+ #include <fb_spi_flash.h>
+ #include <part.h>
+ #include <stdlib.h>
++#include <time.h>
+ #include <vsprintf.h>
+ #include <linux/printk.h>
+ 
+@@ -138,11 +139,15 @@ static const struct {
+  *
+  * Return: Executed command, or -1 if not recognized
+  */
++ulong fastboot_last_command;
++
+ int fastboot_handle_command(char *cmd_string, char *response)
+ {
+ 	int i;
+ 	char *cmd_parameter;
+ 
++	fastboot_last_command = get_timer(0);
++
+ 	cmd_parameter = cmd_string;
+ 	strsep(&cmd_parameter, ":");
+ 
+@@ -284,6 +289,7 @@ void fastboot_data_download(const void *fastboot_data,
+ 			    unsigned int fastboot_data_len,
+ 			    char *response)
+ {
++	fastboot_last_command = get_timer(0);
+ #define BYTES_PER_DOT	0x20000
+ 	u32 pre_dot_num, now_dot_num;
+ 
+diff --git a/include/fastboot.h b/include/fastboot.h
+index b106d61..ec7ed35 100644
+--- a/include/fastboot.h
++++ b/include/fastboot.h
+@@ -137,6 +137,13 @@ void fastboot_init(void *buf_addr, u32 buf_size);
+  */
+ void fastboot_boot(void);
+ 
++/**
++ * fastboot_last_command - get_timer() value of the last fastboot command or
++ * download chunk; `fastboot usb` leaves when ${fastboot_idle_timeout}
++ * seconds pass without one (0 or unset: no timeout)
++ */
++extern ulong fastboot_last_command;
++
+ /**
+  * fastboot_handle_boot() - Shared implementation of system reaction to
+  * fastboot commands
+-- 
+2.43.0
+

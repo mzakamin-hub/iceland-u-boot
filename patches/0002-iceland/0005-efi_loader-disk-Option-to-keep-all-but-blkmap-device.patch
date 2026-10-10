@@ -1,0 +1,62 @@
+From 90512e3ca5346b76576fc11184b5949f8bfb0b5c Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Fri, 2 Oct 2026 12:00:00 +0000
+Subject: [PATCH 2/4] efi_loader: disk: Option to keep all but blkmap devices
+ read-only
+
+On the OnePlus Pad 4 U-Boot is chainloaded by the stock boot loader and
+boots an EFI system from a disk image inside the userdata partition,
+mapped with blkmap. Every other UFS LUN and partition is also exposed to
+EFI applications, writable: a boot loader bug or a stray EFI program
+could write the partitions that keep the device bootable.
+
+Add EFI_DISK_WRITE_BLKMAP_ONLY: block devices other than blkmap devices
+(and their partitions) report read-only media, so WriteBlocks returns
+EFI_WRITE_PROTECTED. GRUB's environment block inside the mapped image
+stays writable.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ lib/efi_loader/Kconfig    | 11 +++++++++++
+ lib/efi_loader/efi_disk.c |  3 +++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/lib/efi_loader/Kconfig b/lib/efi_loader/Kconfig
+index 4cb13ae..e6b199b 100644
+--- a/lib/efi_loader/Kconfig
++++ b/lib/efi_loader/Kconfig
+@@ -430,6 +430,17 @@ config EFI_DT_FIXUP
+ 	  The EFI device-tree fix-up protocol provides a function to let the
+ 	  firmware apply fix-ups. This may be used by boot loaders.
+ 
++config EFI_DISK_WRITE_BLKMAP_ONLY
++	bool "EFI block devices are read-only except blkmap devices"
++	help
++	  Report every block device and partition to EFI applications as
++	  read-only (WriteBlocks returns EFI_WRITE_PROTECTED), except the
++	  blkmap devices that a board script maps on purpose. On a phone or
++	  tablet that chainloads U-Boot from its own boot loader, EFI
++	  applications (shim, GRUB, ...) can then write nothing but the disk
++	  image they boot from, never the partitions of the storage that keep
++	  the device bootable.
++
+ config EFI_LOADER_HII
+ 	bool "HII protocols"
+ 	default y if !HAS_BOARD_SIZE_LIMIT
+diff --git a/lib/efi_loader/efi_disk.c b/lib/efi_loader/efi_disk.c
+index 4a3ace3..4c4d9c0 100644
+--- a/lib/efi_loader/efi_disk.c
++++ b/lib/efi_loader/efi_disk.c
+@@ -548,6 +548,9 @@ static efi_status_t efi_disk_add_dev(
+ 	/* Fill in EFI IO Media info (for read/write callbacks) */
+ 	diskobj->media.removable_media = desc->removable;
+ 	diskobj->media.media_present = 1;
++	if (IS_ENABLED(CONFIG_EFI_DISK_WRITE_BLKMAP_ONLY) &&
++	    desc->uclass_id != UCLASS_BLKMAP)
++		diskobj->media.read_only = 1;
+ 	/*
+ 	 * MediaID is just an arbitrary counter.
+ 	 * We have to change it if the medium is removed or changed.
+-- 
+2.43.0
+

@@ -1,0 +1,8 @@
+u-boot-commit: aac9e744ec6f8dfda7fab340dd3151206bd7bf09
+queue: iceland-u-boot 6e53ddd + wf/install candidates 0004-0007 + wf/ubootloop 0008 + wf/usbinit 0009 + 0010
+u-boot-iceland-usb.img: install build (iceland.env); u-boot-iceland-rehearsal-usb.img: iceland-rehearsal.env, no SCSI/UFS
+u-boot-iceland-usbcold.img: DIAGNOSTIC, RAM boot only: rehearsal build + CMD_PMIC + iceland-usbcold.env (USB into the cold state, then the fastboot loop)
+linux reference: /home/mzak/mainline/build/src 207746cfc
+compiler: aarch64-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+mkbootimg: 808ecd09666ffe0ff5800f02af693abce56eb395; header v4, os_version 17.0.0, os_patch_level 2026-09
+date: 2026-10-10T13:39:45Z

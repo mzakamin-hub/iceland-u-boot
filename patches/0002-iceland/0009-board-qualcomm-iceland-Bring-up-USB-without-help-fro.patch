@@ -1,0 +1,1206 @@
+From 82abf2baa693f30207f85be894854117c5f0d837 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Sat, 10 Oct 2026 15:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: Bring up USB without help from ABL
+
+Written to boot_b and started by ABL in a normal boot (install-day
+probe C0 #2, 10 Oct 2026), U-Boot's fastboot failed every time with
+"dwc3-generic-peripheral usb@a600000: Reset Timed Out / failed to
+initialize core": the DWC3 device soft reset (DCTL.CSFTRST) never
+completes because the eUSB2 PHY gives no UTMI clock. ABL starts USB
+only in its own fastboot mode, and the RAM boots (fastboot boot) always
+came from there; the M31 PHY driver relied on that ("relies on the
+previous bootloader to leave the supplies and repeater enabled"), the
+DT gave the PHY a dummy fixed reference clock.
+
+Do what Linux does (kaanapali.dtsi, kaanapali-oneplus-iceland.dts),
+same voltages and tuning:
+
+- DT: the PHY's reference clock is TCSR_USB2_CLKREF_EN (TCSR clock
+  controller), its supplies vdd = L4F (0.88 V) and vdda12 = L1D
+  (1.2 V) as RPMh regulators (apps_rsc, cmd-db), and its repeater is
+  the eUSB2 repeater of PMIH0108 (SID 7 on the second SPMI bus,
+  supplies L15B 1.8 V and L5B 3.1 V, stock's tuning). USB30 master
+  clock 200 MHz and mock UTMI 19.2 MHz (assigned-clock-rates).
+- phy: qcom: m31-eusb2: enable vdd / vdda12 and init the repeater
+  ("phys") before the PHY reset, as Linux; all optional. Supplies and
+  repeater stay on at power off (L1D also feeds the panel's DSI PHY
+  and the UFS PHY; the OS takes them over).
+- phy: qcom: add the PMIC eUSB2 repeater driver (PM8550B type), a port
+  of the Linux driver; a repeater that does not report OK is logged,
+  the link is still tried.
+- spmi: msm: the further buses of a v8 arbiter (their APIDs follow
+  the first bus's, own channel owner table) as SPMI controllers of
+  their own; bounded waits for a channel's status.
+- soc: qcom: rpmh-rsc: the v3 register layout for every RSC version
+  from 3 on, as Linux.
+- regulator: qcom-rpmh: PMH0101 / PMH0110 LDOs (PMIC5 530 LDO types,
+  "L<n><pmic-id>" resource names); round a voltage up to the next set
+  point (as Linux, never below the DT minimum); the first enable votes
+  the requested voltage, else the DT minimum.
+- clk: qcom: kaanapali: USB30 master / mock UTMI rates, TCSR clkref
+  gates.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ arch/arm/dts/kaanapali-oneplus-iceland.dts    | 122 +++++++++-
+ configs/iceland_defconfig                     |   1 +
+ drivers/clk/qcom/clock-kaanapali.c            |  74 ++++++
+ drivers/phy/qcom/Kconfig                      |   7 +
+ drivers/phy/qcom/Makefile                     |   1 +
+ drivers/phy/qcom/phy-qcom-eusb2-repeater.c    | 218 ++++++++++++++++++
+ drivers/phy/qcom/phy-qcom-m31-eusb2.c         |  69 +++++-
+ drivers/power/regulator/qcom-rpmh-regulator.c | 137 ++++++++++-
+ drivers/soc/qcom/rpmh-rsc.c                   |   2 +-
+ drivers/spmi/spmi-msm.c                       | 164 ++++++++++---
+ 10 files changed, 743 insertions(+), 52 deletions(-)
+ create mode 100755 drivers/phy/qcom/phy-qcom-eusb2-repeater.c
+
+diff --git a/arch/arm/dts/kaanapali-oneplus-iceland.dts b/arch/arm/dts/kaanapali-oneplus-iceland.dts
+index 87c3b077..13a95011 100644
+--- a/arch/arm/dts/kaanapali-oneplus-iceland.dts
++++ b/arch/arm/dts/kaanapali-oneplus-iceland.dts
+@@ -3,14 +3,22 @@
+  * Minimal DT for U-Boot on the OnePlus Pad 4: RAM, UFS, USB for fastboot,
+  * the keys and ABL's framebuffer. Derived from the OnePlus 15 (infiniti)
+  * board, same SoC (SM8850) and PMICs.
++ *
++ * USB is brought up by U-Boot itself (ABL starts it only in its own fastboot
++ * mode): the eUSB2 PHY's supplies (RPMh), its reference clock (TCSR) and the
++ * eUSB2 repeater on PMIH0108 (second SPMI bus), as in the Linux DT
++ * (kaanapali.dtsi, kaanapali-oneplus-iceland.dts), same voltages and tuning.
+  */
+ 
+ /dts-v1/;
+ 
+ #include <dt-bindings/clock/qcom,kaanapali-gcc.h>
+ #include <dt-bindings/clock/qcom,rpmh.h>
++#include <dt-bindings/clock/qcom,sm8750-tcsr.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/input/linux-event-codes.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/soc/qcom,rpmh-rsc.h>
+ #include <dt-bindings/spmi/spmi.h>
+ 
+ / {
+@@ -67,6 +75,12 @@
+ 		splash_region@fc800000 {
+ 			reg = <0x0 0xfc800000 0x0 0x02b00000>;
+ 		};
++
++		aop-cmd-db@81c60000 {
++			compatible = "qcom,cmd-db";
++			reg = <0x0 0x81c60000 0x0 0x20000>;
++			no-map;
++		};
+ 	};
+ 
+ 	gpio-keys {
+@@ -86,12 +100,6 @@
+ 		method = "smc";
+ 	};
+ 
+-	usb_ref_clk: clock-usb-ref {
+-		compatible = "fixed-clock";
+-		#clock-cells = <0>;
+-		clock-frequency = <19200000>;
+-	};
+-
+ 	soc@0 {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;
+@@ -111,6 +119,12 @@
+ 			#power-domain-cells = <1>;
+ 		};
+ 
++		tcsr: clock-controller@1fc0000 {
++			compatible = "qcom,kaanapali-tcsr";
++			reg = <0x0 0x01fc0000 0x0 0x30000>;
++			#clock-cells = <1>;
++		};
++
+ 		ufs_mem_phy: phy@1d80000 {
+ 			compatible = "qcom,kaanapali-qmp-ufs-phy",
+ 				     "qcom,sm8750-qmp-ufs-phy";
+@@ -159,9 +173,12 @@
+ 				     "qcom,sm8750-m31-eusb2-phy";
+ 			reg = <0x0 0x088e3000 0x0 0x400>;
+ 			#phy-cells = <0>;
+-			clocks = <&usb_ref_clk>;
++			clocks = <&tcsr TCSR_USB2_CLKREF_EN>;
+ 			clock-names = "ref";
+ 			resets = <&gcc GCC_QUSB2PHY_PRIM_BCR>;
++			vdd-supply = <&vreg_l4f_0p8>;
++			vdda12-supply = <&vreg_l1d_1p2>;
++			phys = <&pmih0108_e1_eusb2_repeater>;
+ 		};
+ 
+ 		usb@a600000 {
+@@ -174,6 +191,9 @@
+ 				 <&gcc GCC_USB30_PRIM_MOCK_UTMI_CLK>;
+ 			clock-names = "cfg_noc", "core", "iface", "sleep",
+ 				      "mock_utmi";
++			assigned-clocks = <&gcc GCC_USB30_PRIM_MOCK_UTMI_CLK>,
++					  <&gcc GCC_USB30_PRIM_MASTER_CLK>;
++			assigned-clock-rates = <19200000>, <200000000>;
+ 			resets = <&gcc GCC_USB30_PRIM_BCR>;
+ 			power-domains = <&gcc GCC_USB30_PRIM_GDSC>;
+ 			phys = <&usb_1_hsphy>;
+@@ -251,6 +271,94 @@
+ 					};
+ 				};
+ 			};
++
++			spmi@c437000 {
++				reg = <0x0 0x0c437000 0x0 0x4000>,
++				      <0x0 0x0c8d0000 0x0 0x10000>,
++				      <0x0 0x0c43b000 0x0 0x8000>;
++				reg-names = "cnfg", "intr", "chnl_owner";
++				#address-cells = <2>;
++				#size-cells = <0>;
++
++				pmic@7 {
++					compatible = "qcom,pmih0108", "qcom,spmi-pmic";
++					reg = <0x7 SPMI_USID>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					pmih0108_e1_eusb2_repeater: phy@fd00 {
++						compatible = "qcom,pm8550b-eusb2-repeater";
++						reg = <0xfd00>;
++						#phy-cells = <0>;
++						vdd18-supply = <&vreg_l15b_1p8>;
++						vdd3-supply = <&vreg_l5b_3p1>;
++
++						/* stock's device-mode tuning, as in the Linux DT */
++						qcom,tune-usb2-amplitude = /bits/ 8 <14>;
++						qcom,tune-usb2-disc-thres = /bits/ 8 <7>;
++						qcom,squelch-detector-bp = <(-2000)>;
++						qcom,tune-usb2-preem = /bits/ 8 <3>;
++						qcom,tune-usb2-slew = /bits/ 8 <2>;
++					};
++				};
++			};
++		};
++
++		apps_rsc: rsc@18900000 {
++			compatible = "qcom,rpmh-rsc";
++			reg = <0x0 0x18900000 0x0 0x10000>,
++			      <0x0 0x18910000 0x0 0x10000>,
++			      <0x0 0x18920000 0x0 0x10000>;
++			reg-names = "drv-0", "drv-1", "drv-2";
++			label = "apps_rsc";
++			qcom,tcs-offset = <0xd00>;
++			qcom,drv-id = <2>;
++			qcom,tcs-config = <ACTIVE_TCS 3>, <SLEEP_TCS 2>,
++					  <WAKE_TCS 2>, <CONTROL_TCS 0>;
++
++			/* only the supplies of the USB 2 PHY and repeater */
++			regulators-0 {
++				compatible = "qcom,pmh0101-rpmh-regulators";
++				qcom,pmic-id = "B_E0";
++
++				vreg_l5b_3p1: ldo5 {
++					regulator-name = "vreg_l5b_3p1";
++					regulator-min-microvolt = <3100000>;
++					regulator-max-microvolt = <3148000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
++				};
++
++				vreg_l15b_1p8: ldo15 {
++					regulator-name = "vreg_l15b_1p8";
++					regulator-min-microvolt = <1800000>;
++					regulator-max-microvolt = <1800000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
++				};
++			};
++
++			regulators-1 {
++				compatible = "qcom,pmh0110-rpmh-regulators";
++				qcom,pmic-id = "D_E0";
++
++				vreg_l1d_1p2: ldo1 {
++					regulator-name = "vreg_l1d_1p2";
++					regulator-min-microvolt = <1200000>;
++					regulator-max-microvolt = <1256000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
++				};
++			};
++
++			regulators-2 {
++				compatible = "qcom,pmh0110-rpmh-regulators";
++				qcom,pmic-id = "F_E0";
++
++				vreg_l4f_0p8: ldo4 {
++					regulator-name = "vreg_l4f_0p8";
++					regulator-min-microvolt = <880000>;
++					regulator-max-microvolt = <912000>;
++					regulator-initial-mode = <RPMH_REGULATOR_MODE_AUTO>;
++				};
++			};
+ 		};
+ 	};
+ };
+diff --git a/configs/iceland_defconfig b/configs/iceland_defconfig
+index 72069d30..5158d389 100644
+--- a/configs/iceland_defconfig
++++ b/configs/iceland_defconfig
+@@ -7,6 +7,7 @@ CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/iceland.env"
+ CONFIG_ENV_RELOC_GD_ENV_ADDR=y
+ CONFIG_LNX_KRNL_IMG_TEXT_OFFSET_BASE=0x0
+ CONFIG_PHY_QCOM_M31_EUSB2=y
++CONFIG_PHY_QCOM_EUSB2_REPEATER=y
+ # CONFIG_QCOM_RPMH_POWER_DOMAIN is not set
+ CONFIG_USB_FUNCTION_FASTBOOT=y
+ # 1 GiB download buffer in the 9 GiB RAM bank (a rehearsal head is a few hundred MB of gzip)
+diff --git a/drivers/clk/qcom/clock-kaanapali.c b/drivers/clk/qcom/clock-kaanapali.c
+index 92b8b955..cda48e49 100644
+--- a/drivers/clk/qcom/clock-kaanapali.c
++++ b/drivers/clk/qcom/clock-kaanapali.c
+@@ -14,6 +14,7 @@
+ #include <linux/bug.h>
+ #include <linux/bitops.h>
+ #include <dt-bindings/clock/qcom,kaanapali-gcc.h>
++#include <dt-bindings/clock/qcom,sm8750-tcsr.h>
+ 
+ #include "clock-qcom.h"
+ 
+@@ -41,6 +42,14 @@ static const struct freq_tbl ftbl_gcc_sdcc2_apps_clk_src[] = {
+ 	{ }
+ };
+ 
++static const struct freq_tbl ftbl_gcc_usb30_prim_master_clk_src[] = {
++	F(66666667, CFG_CLK_SRC_GPLL0_EVEN, 4.5, 0, 0),
++	F(133333333, CFG_CLK_SRC_GPLL0, 4.5, 0, 0),
++	F(200000000, CFG_CLK_SRC_GPLL0, 3, 0, 0),
++	F(240000000, CFG_CLK_SRC_GPLL0, 2.5, 0, 0),
++	{ }
++};
++
+ static ulong kaanapali_set_rate(struct clk *clk, ulong rate)
+ {
+ 	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
+@@ -57,6 +66,14 @@ static ulong kaanapali_set_rate(struct clk *clk, ulong rate)
+ 		clk_rcg_set_rate_mnd(priv->base, 0x1401c,
+ 				     freq->pre_div, freq->m, freq->n, freq->src, 8);
+ 		return freq->freq;
++	case GCC_USB30_PRIM_MASTER_CLK:
++		freq = qcom_find_freq(ftbl_gcc_usb30_prim_master_clk_src, rate);
++		clk_rcg_set_rate_mnd(priv->base, 0x39034,
++				     freq->pre_div, freq->m, freq->n, freq->src, 8);
++		return freq->freq;
++	case GCC_USB30_PRIM_MOCK_UTMI_CLK:
++		clk_rcg_set_rate(priv->base, 0x3904c, 1, CFG_CLK_SRC_CXO);
++		return 19200000;
+ 	default:
+ 		return 0;
+ 	}
+@@ -239,3 +256,60 @@ U_BOOT_DRIVER(gcc_kaanapali) = {
+ 	.bind		= qcom_cc_bind,
+ 	.flags		= DM_FLAG_PRE_RELOC,
+ };
++
++/* TCSRCC */
++
++static const struct gate_clk kaanapali_tcsr_clks[] = {
++	GATE_CLK(TCSR_PCIE_0_CLKREF_EN,		0x15044, BIT(0)),
++	GATE_CLK(TCSR_UFS_CLKREF_EN,		0x15054, BIT(0)),
++	GATE_CLK(TCSR_USB2_CLKREF_EN,		0x1505c, BIT(0)),
++	GATE_CLK(TCSR_USB3_CLKREF_EN,		0x1504c, BIT(0)),
++};
++
++static struct msm_clk_data kaanapali_tcsrcc_data = {
++	.clks = kaanapali_tcsr_clks,
++	.num_clks = ARRAY_SIZE(kaanapali_tcsr_clks),
++};
++
++static int tcsrcc_kaanapali_clk_enable(struct clk *clk)
++{
++	struct msm_clk_priv *priv = dev_get_priv(clk->dev);
++
++	return qcom_gate_clk_en(priv, clk->id);
++}
++
++static int tcsrcc_kaanapali_clk_probe(struct udevice *dev)
++{
++	struct msm_clk_data *data = (struct msm_clk_data *)dev_get_driver_data(dev);
++	struct msm_clk_priv *priv = dev_get_priv(dev);
++
++	priv->base = dev_read_addr(dev);
++	if (priv->base == FDT_ADDR_T_NONE)
++		return -EINVAL;
++
++	priv->data = data;
++
++	return 0;
++}
++
++static struct clk_ops tcsrcc_kaanapali_clk_ops = {
++	.enable = tcsrcc_kaanapali_clk_enable,
++};
++
++static const struct udevice_id tcsrcc_kaanapali_of_match[] = {
++	{
++		.compatible = "qcom,kaanapali-tcsr",
++		.data = (ulong)&kaanapali_tcsrcc_data,
++	},
++	{ }
++};
++
++U_BOOT_DRIVER(tcsrcc_kaanapali) = {
++	.name		= "tcsrcc_kaanapali",
++	.id		= UCLASS_CLK,
++	.of_match	= tcsrcc_kaanapali_of_match,
++	.ops		= &tcsrcc_kaanapali_clk_ops,
++	.priv_auto	= sizeof(struct msm_clk_priv),
++	.probe		= tcsrcc_kaanapali_clk_probe,
++	.flags		= DM_FLAG_DEFAULT_PD_CTRL_OFF,
++};
+diff --git a/drivers/phy/qcom/Kconfig b/drivers/phy/qcom/Kconfig
+index 66352685..0d54ed21 100644
+--- a/drivers/phy/qcom/Kconfig
++++ b/drivers/phy/qcom/Kconfig
+@@ -62,6 +62,13 @@ config PHY_QCOM_M31_EUSB2
+ 	  Enable this to support the Qualcomm M31 eUSB2 High-Speed PHY found
+ 	  on SM8750 and newer SoCs.
+ 
++config PHY_QCOM_EUSB2_REPEATER
++	bool "Qualcomm PMIC eUSB2 Repeater"
++	depends on PHY && ARCH_SNAPDRAGON && DM_PMIC
++	help
++	  Enable this to support the eUSB2 repeater found in Qualcomm PMICs
++	  such as PM8550B, used together with the eUSB2 PHYs (SNPS, M31).
++
+ config PHY_QCOM_USB_HS_28NM
+ 	bool "Qualcomm 28nm High-Speed PHY"
+ 	depends on PHY && ARCH_SNAPDRAGON
+diff --git a/drivers/phy/qcom/Makefile b/drivers/phy/qcom/Makefile
+index 3c659133..8a51068a 100644
+--- a/drivers/phy/qcom/Makefile
++++ b/drivers/phy/qcom/Makefile
+@@ -7,5 +7,6 @@ obj-$(CONFIG_PHY_QCOM_QUSB2) += phy-qcom-qusb2.o
+ obj-$(CONFIG_PHY_QCOM_USB_SNPS_FEMTO_V2) += phy-qcom-snps-femto-v2.o
+ obj-$(CONFIG_PHY_QCOM_SNPS_EUSB2) += phy-qcom-snps-eusb2.o
+ obj-$(CONFIG_PHY_QCOM_M31_EUSB2) += phy-qcom-m31-eusb2.o
++obj-$(CONFIG_PHY_QCOM_EUSB2_REPEATER) += phy-qcom-eusb2-repeater.o
+ obj-$(CONFIG_PHY_QCOM_USB_HS_28NM) += phy-qcom-usb-hs-28nm.o
+ obj-$(CONFIG_PHY_QCOM_USB_SS) += phy-qcom-usb-ss.o
+diff --git a/drivers/phy/qcom/phy-qcom-eusb2-repeater.c b/drivers/phy/qcom/phy-qcom-eusb2-repeater.c
+new file mode 100755
+index 00000000..363dfafa
+--- /dev/null
++++ b/drivers/phy/qcom/phy-qcom-eusb2-repeater.c
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Qualcomm PMIC eUSB2 repeater, based on the Linux driver
++ * (drivers/phy/qualcomm/phy-qcom-eusb2-repeater.c).
++ *
++ * The repeater translates the eUSB2 signalling of the SoC's eUSB2 PHY to
++ * USB 2.0 levels on the connector. Enabled with its supplies and tuned as
++ * Linux does; it is left enabled for the OS (no exit), as the boot loader
++ * leaves it.
++ *
++ * Copyright (c) 2023, Linaro Limited
++ */
++
++#include <dm.h>
++#include <dm/device_compat.h>
++#include <generic-phy.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <power/pmic.h>
++#include <power/regulator.h>
++
++/* eUSB2 status registers */
++#define EUSB2_RPTR_STATUS		0x08
++#define RPTR_OK				BIT(7)
++
++/* eUSB2 control registers */
++#define EUSB2_EN_CTL1			0x46
++#define EUSB2_RPTR_EN			BIT(7)
++
++#define EUSB2_TUNE_IUSB2		0x51
++#define EUSB2_TUNE_RES_FSDIF		0x52
++#define EUSB2_TUNE_HSDISC		0x53
++#define EUSB2_TUNE_SQUELCH_U		0x54
++#define EUSB2_TUNE_USB2_SLEW		0x55
++#define EUSB2_TUNE_USB2_PREEM		0x57
++
++#define EUSB2_RPTR_OK_TIMEOUT_US	1000
++
++static const int squelch_detector[] = {
++	[0] = -6000,
++	[1] = -5000,
++	[2] = -4000,
++	[3] = -3000,
++	[4] = -2000,
++	[5] = -1000,
++	[6] = 0,
++	[7] = 1000,
++};
++
++struct eusb2_repeater_init_tbl_reg {
++	u8 reg;
++	u8 value;
++};
++
++struct eusb2_repeater_cfg {
++	const struct eusb2_repeater_init_tbl_reg *init_tbl;
++	int init_tbl_num;
++};
++
++struct eusb2_repeater_priv {
++	struct udevice *pmic;
++	u32 base;
++	const struct eusb2_repeater_cfg *cfg;
++	struct udevice *vdd18;
++	struct udevice *vdd3;
++};
++
++static const struct eusb2_repeater_init_tbl_reg pm8550b_init_tbl[] = {
++	{ EUSB2_TUNE_IUSB2, 0x8 },
++	{ EUSB2_TUNE_SQUELCH_U, 0x3 },
++	{ EUSB2_TUNE_USB2_PREEM, 0x5 },
++};
++
++static const struct eusb2_repeater_cfg pm8550b_eusb2_cfg = {
++	.init_tbl	= pm8550b_init_tbl,
++	.init_tbl_num	= ARRAY_SIZE(pm8550b_init_tbl),
++};
++
++static int eusb2_repeater_write(struct eusb2_repeater_priv *priv, u8 reg, u8 val)
++{
++	return pmic_reg_write(priv->pmic, priv->base + reg, val);
++}
++
++static void eusb2_repeater_enable_supply(struct udevice *dev,
++					 struct udevice *supply,
++					 const char *name)
++{
++	int ret;
++
++	if (!supply)
++		return;
++
++	ret = regulator_set_enable_if_allowed(supply, true);
++	if (ret)
++		dev_err(dev, "failed to enable %s supply: %d\n", name, ret);
++}
++
++static int eusb2_repeater_init(struct phy *phy)
++{
++	struct udevice *dev = phy->dev;
++	struct eusb2_repeater_priv *priv = dev_get_priv(dev);
++	unsigned int us;
++	s32 dt_val;
++	int ret, i;
++	u8 val;
++
++	eusb2_repeater_enable_supply(dev, priv->vdd18, "vdd18");
++	eusb2_repeater_enable_supply(dev, priv->vdd3, "vdd3");
++
++	ret = eusb2_repeater_write(priv, EUSB2_EN_CTL1, EUSB2_RPTR_EN);
++	if (ret) {
++		dev_err(dev, "failed to enable the repeater: %d\n", ret);
++		return ret;
++	}
++
++	/* Write registers from init table */
++	for (i = 0; i < priv->cfg->init_tbl_num; i++)
++		eusb2_repeater_write(priv, priv->cfg->init_tbl[i].reg,
++				     priv->cfg->init_tbl[i].value);
++
++	/* Override registers from devicetree values */
++	if (!dev_read_u8(dev, "qcom,tune-usb2-preem", &val))
++		eusb2_repeater_write(priv, EUSB2_TUNE_USB2_PREEM, val);
++
++	if (!dev_read_u8(dev, "qcom,tune-usb2-disc-thres", &val))
++		eusb2_repeater_write(priv, EUSB2_TUNE_HSDISC, val);
++
++	if (!dev_read_u8(dev, "qcom,tune-usb2-amplitude", &val))
++		eusb2_repeater_write(priv, EUSB2_TUNE_IUSB2, val);
++
++	if (!dev_read_u8(dev, "qcom,tune-res-fsdif", &val))
++		eusb2_repeater_write(priv, EUSB2_TUNE_RES_FSDIF, val);
++
++	if (!dev_read_u8(dev, "qcom,tune-usb2-slew", &val))
++		eusb2_repeater_write(priv, EUSB2_TUNE_USB2_SLEW, val);
++
++	if (!dev_read_s32(dev, "qcom,squelch-detector-bp", &dt_val)) {
++		for (i = 0; i < ARRAY_SIZE(squelch_detector); i++) {
++			if (squelch_detector[i] == dt_val) {
++				eusb2_repeater_write(priv, EUSB2_TUNE_SQUELCH_U, i);
++				break;
++			}
++		}
++	}
++
++	/* Wait for status OK */
++	for (us = 0; us < EUSB2_RPTR_OK_TIMEOUT_US; us += 10) {
++		ret = pmic_reg_read(priv->pmic, priv->base + EUSB2_RPTR_STATUS);
++		if (ret >= 0 && (ret & RPTR_OK))
++			return 0;
++		udelay(10);
++	}
++
++	/* Not fatal here: let the PHY and the controller try the link */
++	dev_err(dev, "initialization timed-out (status %#x)\n", ret);
++
++	return 0;
++}
++
++static struct phy_ops eusb2_repeater_ops = {
++	.init = eusb2_repeater_init,
++};
++
++static int eusb2_repeater_get_supply(struct udevice *dev, const char *prop,
++				     struct udevice **supply)
++{
++	int ret;
++
++	ret = device_get_supply_regulator(dev, prop, supply);
++	if (ret == -ENOENT) {
++		*supply = NULL;
++		return 0;
++	}
++	if (ret) {
++		dev_err(dev, "failed to get %s: %d\n", prop, ret);
++		*supply = NULL;
++	}
++
++	return 0;
++}
++
++static int eusb2_repeater_probe(struct udevice *dev)
++{
++	struct eusb2_repeater_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	priv->cfg = (const struct eusb2_repeater_cfg *)dev_get_driver_data(dev);
++	if (!priv->cfg)
++		return -EINVAL;
++
++	priv->pmic = dev_get_parent(dev);
++
++	ret = dev_read_u32(dev, "reg", &priv->base);
++	if (ret)
++		return ret;
++
++	eusb2_repeater_get_supply(dev, "vdd18-supply", &priv->vdd18);
++	eusb2_repeater_get_supply(dev, "vdd3-supply", &priv->vdd3);
++
++	return 0;
++}
++
++static const struct udevice_id eusb2_repeater_ids[] = {
++	{
++		.compatible = "qcom,pm8550b-eusb2-repeater",
++		.data = (ulong)&pm8550b_eusb2_cfg,
++	},
++	{ }
++};
++
++U_BOOT_DRIVER(qcom_eusb2_repeater) = {
++	.name = "qcom-eusb2-repeater",
++	.id = UCLASS_PHY,
++	.of_match = eusb2_repeater_ids,
++	.ops = &eusb2_repeater_ops,
++	.probe = eusb2_repeater_probe,
++	.priv_auto = sizeof(struct eusb2_repeater_priv),
++};
+diff --git a/drivers/phy/qcom/phy-qcom-m31-eusb2.c b/drivers/phy/qcom/phy-qcom-m31-eusb2.c
+index 35c249fe..9f6d3a7b 100644
+--- a/drivers/phy/qcom/phy-qcom-m31-eusb2.c
++++ b/drivers/phy/qcom/phy-qcom-m31-eusb2.c
+@@ -1,7 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Qualcomm M31 eUSB2 High-Speed PHY, based on the Linux driver. Relies on
+- * the previous bootloader to leave the supplies and repeater enabled.
++ * Qualcomm M31 eUSB2 High-Speed PHY, based on the Linux driver. Enables the
++ * vdd / vdda12 supplies and the eUSB2 repeater ("phys") when the DT has them,
++ * as Linux does, so it also works when the previous boot loader did not start
++ * USB. Supplies and repeater are left on at power off (they may be shared, and
++ * the OS takes them over).
+  *
+  * Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+@@ -12,6 +15,7 @@
+ #include <dm/device_compat.h>
+ #include <generic-phy.h>
+ #include <reset.h>
++#include <power/regulator.h>
+ 
+ #include <asm/io.h>
+ #include <linux/bitops.h>
+@@ -100,6 +104,9 @@ struct m31eusb2_phy_priv {
+ 	void __iomem		*base;
+ 	struct clk		*ref_clk;
+ 	struct reset_ctl_bulk	resets;
++	struct udevice		*vdd;
++	struct udevice		*vdda12;
++	struct phy		repeater;
+ 	unsigned int		fsel;
+ };
+ 
+@@ -128,12 +135,36 @@ static void m31eusb2_phy_write_sequence(struct m31eusb2_phy_priv *priv,
+ 					tbl->val << __ffs(tbl->mask));
+ }
+ 
++static void m31eusb2_phy_enable_supply(struct udevice *dev,
++				       struct udevice *supply, const char *name)
++{
++	int ret;
++
++	if (!supply)
++		return;
++
++	ret = regulator_set_enable_if_allowed(supply, true);
++	if (ret)
++		dev_err(dev, "failed to enable %s supply: %d\n", name, ret);
++}
++
+ static int m31eusb2_phy_power_on(struct phy *phy)
+ {
+ 	struct m31eusb2_phy_priv *priv = dev_get_priv(phy->dev);
+ 	int ret;
+ 
+-	clk_prepare_enable(priv->ref_clk);
++	m31eusb2_phy_enable_supply(phy->dev, priv->vdd, "vdd");
++	m31eusb2_phy_enable_supply(phy->dev, priv->vdda12, "vdda12");
++
++	if (generic_phy_valid(&priv->repeater)) {
++		ret = generic_phy_init(&priv->repeater);
++		if (ret)
++			dev_err(phy->dev, "repeater init failed: %d\n", ret);
++	}
++
++	ret = clk_prepare_enable(priv->ref_clk);
++	if (ret)
++		dev_err(phy->dev, "failed to enable ref clock: %d\n", ret);
+ 
+ 	/* Perform phy reset */
+ 	reset_assert_bulk(&priv->resets);
+@@ -164,6 +195,26 @@ static int m31eusb2_phy_power_off(struct phy *phy)
+ 	return 0;
+ }
+ 
++/*
++ * Optional supply: none in the DT is not an error (the previous boot loader
++ * then has to leave it on); a supply that cannot be probed is reported and
++ * left as the boot loader set it.
++ */
++static int m31eusb2_phy_get_supply(struct udevice *dev, const char *prop,
++				   struct udevice **supply)
++{
++	int ret;
++
++	*supply = NULL;
++	ret = device_get_supply_regulator(dev, prop, supply);
++	if (ret && ret != -ENOENT) {
++		dev_err(dev, "failed to get %s: %d\n", prop, ret);
++		*supply = NULL;
++	}
++
++	return 0;
++}
++
+ static int m31eusb2_phy_probe(struct udevice *dev)
+ {
+ 	struct m31eusb2_phy_priv *priv = dev_get_priv(dev);
+@@ -186,6 +237,18 @@ static int m31eusb2_phy_probe(struct udevice *dev)
+ 		return ret;
+ 	}
+ 
++	ret = m31eusb2_phy_get_supply(dev, "vdd-supply", &priv->vdd);
++	if (ret)
++		return ret;
++
++	ret = m31eusb2_phy_get_supply(dev, "vdda12-supply", &priv->vdda12);
++	if (ret)
++		return ret;
++
++	ret = generic_phy_get_by_index(dev, 0, &priv->repeater);
++	if (ret && ret != -ENOENT)
++		dev_err(dev, "failed to get the repeater: %d\n", ret);
++
+ 	priv->fsel = FSEL_38_4_MHZ_VAL;
+ 
+ 	return 0;
+diff --git a/drivers/power/regulator/qcom-rpmh-regulator.c b/drivers/power/regulator/qcom-rpmh-regulator.c
+index c458f227..0137c2df 100644
+--- a/drivers/power/regulator/qcom-rpmh-regulator.c
++++ b/drivers/power/regulator/qcom-rpmh-regulator.c
+@@ -72,6 +72,11 @@ enum rpmh_regulator_mode {
+ #define PMIC5_BOB_MODE_AUTO			6
+ #define PMIC5_BOB_MODE_PWM			7
+ 
++#define PMIC530_LDO_MODE_RETENTION		3
++#define PMIC530_LDO_MODE_LPM			4
++#define PMIC530_LDO_MODE_OPM			5
++#define PMIC530_LDO_MODE_HPM			7
++
+ 
+ /**
+  * struct linear_range - table of selector - value pairs
+@@ -166,6 +171,8 @@ struct rpmh_vreg {
+ 	bool				bypassed;
+ 	int				uv;
+ 	int			mode;
++	bool				uv_cached;
++	bool				uv_voted;
+ };
+ 
+ /**
+@@ -251,13 +258,16 @@ static int _rpmh_regulator_vrm_set_value(struct udevice *rdev,
+ 	int ret;
+ 	unsigned int selector;
+ 
+-	selector = (uv - vreg->hw_data->voltage_range.min) / vreg->hw_data->voltage_range.step;
++	selector = DIV_ROUND_UP(uv - vreg->hw_data->voltage_range.min,
++			       vreg->hw_data->voltage_range.step);
+ 	cmd.data = DIV_ROUND_UP(vreg->hw_data->voltage_range.min +
+ 				selector * vreg->hw_data->voltage_range.step, 1000);
+ 
+ 	ret = rpmh_regulator_send_request(vreg, &cmd, wait_for_ack);
+-	if (!ret)
++	if (!ret) {
+ 		vreg->uv = cmd.data * 1000;
++		vreg->uv_voted = true;
++	}
+ 
+ 	return ret;
+ }
+@@ -275,6 +285,7 @@ static int rpmh_regulator_vrm_set_value(struct udevice *rdev,
+ 		 * enabled or disabled.
+ 		 */
+ 		vreg->uv = uv;
++		vreg->uv_cached = true;
+ 		return 0;
+ 	}
+ 
+@@ -388,12 +399,21 @@ static int rpmh_regulator_set_enable_state(struct udevice *rdev,
+ 			return ret;
+ 	}
+ 
+-	if (vreg->enabled == -EINVAL &&
+-	    vreg->uv != -ENOTRECOVERABLE) {
+-		ret = _rpmh_regulator_vrm_set_value(rdev,
+-						    vreg->uv, true);
+-		if (ret < 0)
+-			return ret;
++	/*
++	 * The first enable votes a voltage: the one a consumer asked for
++	 * before, else the DT minimum (as Linux's regulator core applies the
++	 * constraints when it registers the regulator). A voltage that was
++	 * only read back from RPMh is not taken for a request.
++	 */
++	if (enable && !vreg->uv_voted) {
++		struct dm_regulator_uclass_plat *plat = dev_get_uclass_plat(rdev);
++		int uv = vreg->uv_cached ? vreg->uv : plat->min_uV;
++
++		if (uv > 0) {
++			ret = _rpmh_regulator_vrm_set_value(rdev, uv, true);
++			if (ret < 0)
++				return ret;
++		}
+ 	}
+ 
+ 	ret = rpmh_regulator_send_request(vreg, &cmd, enable);
+@@ -622,6 +642,66 @@ static const struct rpmh_vreg_hw_data pmic5_pldo515_mv = {
+ 	.n_modes = ARRAY_SIZE(pmic_mode_map_pmic5_ldo),
+ };
+ 
++static struct dm_regulator_mode pmic_mode_map_pmic530_ldo[] = {
++	{
++		.id = REGULATOR_MODE_RETENTION,
++		.register_value = PMIC530_LDO_MODE_RETENTION,
++		.name = "PMIC530_LDO_MODE_RETENTION"
++	}, {
++		.id = REGULATOR_MODE_LPM,
++		.register_value = PMIC530_LDO_MODE_LPM,
++		.name = "PMIC530_LDO_MODE_LPM"
++	}, {
++		.id = REGULATOR_MODE_AUTO,
++		.register_value = PMIC530_LDO_MODE_OPM,
++		.name = "PMIC530_LDO_MODE_OPM"
++	}, {
++		.id = REGULATOR_MODE_HPM,
++		.register_value = PMIC530_LDO_MODE_HPM,
++		.name = "PMIC530_LDO_MODE_HPM"
++	},
++};
++
++static const struct rpmh_vreg_hw_data pmic5_nldo530 = {
++	.regulator_type = VRM,
++	.ops = &rpmh_regulator_vrm_drms_ops,
++	.voltage_range = REGULATOR_LINEAR_RANGE(320000, 0, 210, 8000),
++	.n_voltages = 211,
++	.hpm_min_load_uA = 30000,
++	.pmic_mode_map = pmic_mode_map_pmic530_ldo,
++	.n_modes = ARRAY_SIZE(pmic_mode_map_pmic530_ldo),
++};
++
++static const struct rpmh_vreg_hw_data pmic5_pldo530_mvp150 = {
++	.regulator_type = VRM,
++	.ops = &rpmh_regulator_vrm_drms_ops,
++	.voltage_range = REGULATOR_LINEAR_RANGE(1504000, 0, 255, 8000),
++	.n_voltages = 256,
++	.hpm_min_load_uA = 10000,
++	.pmic_mode_map = pmic_mode_map_pmic530_ldo,
++	.n_modes = ARRAY_SIZE(pmic_mode_map_pmic530_ldo),
++};
++
++static const struct rpmh_vreg_hw_data pmic5_pldo530_mvp300 = {
++	.regulator_type = VRM,
++	.ops = &rpmh_regulator_vrm_drms_ops,
++	.voltage_range = REGULATOR_LINEAR_RANGE(1504000, 0, 255, 8000),
++	.n_voltages = 256,
++	.hpm_min_load_uA = 20000,
++	.pmic_mode_map = pmic_mode_map_pmic530_ldo,
++	.n_modes = ARRAY_SIZE(pmic_mode_map_pmic530_ldo),
++};
++
++static const struct rpmh_vreg_hw_data pmic5_pldo530_mvp600 = {
++	.regulator_type = VRM,
++	.ops = &rpmh_regulator_vrm_drms_ops,
++	.voltage_range = REGULATOR_LINEAR_RANGE(1504000, 0, 255, 8000),
++	.n_voltages = 256,
++	.hpm_min_load_uA = 40000,
++	.pmic_mode_map = pmic_mode_map_pmic530_ldo,
++	.n_modes = ARRAY_SIZE(pmic_mode_map_pmic530_ldo),
++};
++
+ #define RPMH_VREG(_name, _resource_name, _hw_data, _supply_name) \
+ { \
+ 	.name		= _name, \
+@@ -837,6 +917,39 @@ static const struct rpmh_vreg_init_data pm8350c_vreg_data[] = {
+ 	{}
+ };
+ 
++static const struct rpmh_vreg_init_data pmh0101_vreg_data[] = {
++	RPMH_VREG("ldo1",   "L1%s",   &pmic5_nldo530,        "vdd-l1-l4-l10"),
++	RPMH_VREG("ldo2",   "L2%s",   &pmic5_pldo530_mvp300, "vdd-l2-l13-l14"),
++	RPMH_VREG("ldo3",   "L3%s",   &pmic5_nldo530,        "vdd-l3-l11"),
++	RPMH_VREG("ldo4",   "L4%s",   &pmic5_nldo530,        "vdd-l1-l4-l10"),
++	RPMH_VREG("ldo5",   "L5%s",   &pmic5_pldo530_mvp150, "vdd-l5-l16"),
++	RPMH_VREG("ldo6",   "L6%s",   &pmic5_pldo530_mvp300, "vdd-l6-l7"),
++	RPMH_VREG("ldo7",   "L7%s",   &pmic5_pldo530_mvp300, "vdd-l6-l7"),
++	RPMH_VREG("ldo8",   "L8%s",   &pmic5_pldo530_mvp150, "vdd-l8-l9"),
++	RPMH_VREG("ldo9",   "L9%s",   &pmic5_pldo515_mv,     "vdd-l8-l9"),
++	RPMH_VREG("ldo10",  "L10%s",  &pmic5_nldo530,        "vdd-l1-l4-l10"),
++	RPMH_VREG("ldo11",  "L11%s",  &pmic5_nldo530,        "vdd-l3-l11"),
++	RPMH_VREG("ldo12",  "L12%s",  &pmic5_nldo530,        "vdd-l12"),
++	RPMH_VREG("ldo13",  "L13%s",  &pmic5_pldo530_mvp150, "vdd-l2-l13-l14"),
++	RPMH_VREG("ldo14",  "L14%s",  &pmic5_pldo530_mvp150, "vdd-l2-l13-l14"),
++	RPMH_VREG("ldo15",  "L15%s",  &pmic5_nldo530,        "vdd-l15"),
++	RPMH_VREG("ldo16",  "L16%s",  &pmic5_pldo530_mvp600, "vdd-l5-l16"),
++	RPMH_VREG("ldo17",  "L17%s",  &pmic5_pldo515_mv,     "vdd-l17"),
++	RPMH_VREG("ldo18",  "L18%s",  &pmic5_nldo530,        "vdd-l18"),
++	RPMH_VREG("bob1",   "B1%s",   &pmic5_bob,            "vdd-bob1"),
++	RPMH_VREG("bob2",   "B2%s",   &pmic5_bob,            "vdd-bob2"),
++	{}
++};
++
++static const struct rpmh_vreg_init_data pmh0110_vreg_data[] = {
++	/* smps1 - smps10 are not added to u-boot yet */
++	RPMH_VREG("ldo1",   "L1%s",   &pmic5_nldo530,        "vdd-l1"),
++	RPMH_VREG("ldo2",   "L2%s",   &pmic5_nldo530,        "vdd-l2"),
++	RPMH_VREG("ldo3",   "L3%s",   &pmic5_nldo530,        "vdd-l3"),
++	RPMH_VREG("ldo4",   "L4%s",   &pmic5_nldo530,        "vdd-l4"),
++	{}
++};
++
+ static const struct rpmh_vreg_init_data pm7325_vreg_data[] = {
+ 	RPMH_VREG("smps1",  "smp%s1",  &pmic5_hfsmps510, "vdd-s1"),
+ 	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps520, "vdd-s2"),
+@@ -1018,6 +1131,14 @@ static const struct udevice_id rpmh_regulator_ids[] = {
+ 		.compatible = "qcom,pmm8654au-rpmh-regulators",
+ 		.data = (ulong)pmm8654au_vreg_data,
+ 	},
++	{
++		.compatible = "qcom,pmh0101-rpmh-regulators",
++		.data = (ulong)pmh0101_vreg_data,
++	},
++	{
++		.compatible = "qcom,pmh0110-rpmh-regulators",
++		.data = (ulong)pmh0110_vreg_data,
++	},
+ 	{ /* sentinal */ },
+ };
+ 
+diff --git a/drivers/soc/qcom/rpmh-rsc.c b/drivers/soc/qcom/rpmh-rsc.c
+index 0b821cc6..f8aa2885 100644
+--- a/drivers/soc/qcom/rpmh-rsc.c
++++ b/drivers/soc/qcom/rpmh-rsc.c
+@@ -535,7 +535,7 @@ static int rpmh_rsc_probe(struct udevice *dev)
+ 	drv->ver.minor = rsc_id & (MINOR_VER_MASK << MINOR_VER_SHIFT);
+ 	drv->ver.minor >>= MINOR_VER_SHIFT;
+ 
+-	if (drv->ver.major == 3)
++	if (drv->ver.major >= 3)
+ 		drv->regs = rpmh_rsc_reg_offset_ver_3_0;
+ 	else
+ 		drv->regs = rpmh_rsc_reg_offset_ver_2_7;
+diff --git a/drivers/spmi/spmi-msm.c b/drivers/spmi/spmi-msm.c
+index 4643b0f0..833419cc 100644
+--- a/drivers/spmi/spmi-msm.c
++++ b/drivers/spmi/spmi-msm.c
+@@ -14,6 +14,7 @@
+ #include <dm/device_compat.h>
+ #include <dm/lists.h>
+ #include <linux/ioport.h>
++#include <linux/iopoll.h>
+ #include <spmi/spmi.h>
+ 
+ /* PMIC Arbiter configuration registers */
+@@ -60,6 +61,7 @@
+ #define SPMI_CMD_EXT_REG_READ_LONG 0x01
+ 
+ #define SPMI_STATUS_DONE 0x1
++#define SPMI_STATUS_TIMEOUT_US 1000
+ 
+ #define SPMI_MAX_CHANNELS 128
+ #define SPMI_MAX_CHANNELS_V5	512
+@@ -97,6 +99,7 @@ struct msm_spmi_priv {
+ 	phys_addr_t spmi_cnfg;  /* SPMI config */
+ 	u32 owner;	/* Current owner */
+ 	unsigned int max_channels; /* Max channels */
++	unsigned int base_apid; /* v8: first APID of this bus */
+ 	/* SPMI channel map */
+ 	uint32_t channel_map[SPMI_MAX_SLAVES][SPMI_MAX_PERIPH];
+ 	/* SPMI bus arbiter version */
+@@ -177,10 +180,10 @@ static int msm_spmi_write(struct udevice *dev, int usid, int pid, int off,
+ 	writel(reg, priv->spmi_chnls + ch_offset + SPMI_REG_CMD0);
+ 
+ 	/* Wait till CMD DONE status */
+-	reg = 0;
+-	while (!reg) {
+-		reg = readl(priv->spmi_chnls + ch_offset +
+-			    SPMI_REG_STATUS);
++	if (readl_poll_timeout(priv->spmi_chnls + ch_offset + SPMI_REG_STATUS,
++			       reg, reg, SPMI_STATUS_TIMEOUT_US)) {
++		printf("SPMI write timeout.\n");
++		return -ETIMEDOUT;
+ 	}
+ 
+ 	if (reg ^ SPMI_STATUS_DONE) {
+@@ -254,9 +257,10 @@ static int msm_spmi_read(struct udevice *dev, int usid, int pid, int off)
+ 	writel(reg, priv->spmi_obs + ch_offset + SPMI_REG_CMD0);
+ 
+ 	/* Wait till CMD DONE status */
+-	reg = 0;
+-	while (!reg) {
+-		reg = readl(priv->spmi_obs + ch_offset + SPMI_REG_STATUS);
++	if (readl_poll_timeout(priv->spmi_obs + ch_offset + SPMI_REG_STATUS,
++			       reg, reg, SPMI_STATUS_TIMEOUT_US)) {
++		printf("SPMI read timeout.\n");
++		return -ETIMEDOUT;
+ 	}
+ 
+ 	if (reg ^ SPMI_STATUS_DONE) {
+@@ -284,7 +288,7 @@ static void msm_spmi_channel_map_v5(struct msm_spmi_priv *priv, unsigned int i,
+ 				    uint8_t slave_id, uint8_t pid)
+ {
+ 	/* Mark channels read-only when from different owner */
+-	uint32_t cnfg = readl(priv->spmi_cnfg + ARB_CHANNEL_OFFSET(i));
++	uint32_t cnfg = readl(priv->spmi_cnfg + ARB_CHANNEL_OFFSET(i - priv->base_apid));
+ 	uint8_t owner = SPMI_OWNERSHIP_PERIPH2OWNER(cnfg);
+ 	bool prev_valid = priv->channel_map[slave_id][pid] & SPMI_CHANNEL_VALID;
+ 	uint32_t prev_read_only = priv->channel_map[slave_id][pid] & SPMI_CHANNEL_READ_ONLY;
+@@ -319,18 +323,27 @@ static void msm_spmi_channel_map_v5(struct msm_spmi_priv *priv, unsigned int i,
+  * Arbiters with several buses describe each bus as a subnode holding its
+  * registers and its PMICs.
+  */
++static bool msm_spmi_is_bus(ofnode node)
++{
++	return !ofnode_read_prop(node, "compatible", NULL) &&
++	       ofnode_read_prop(node, "reg-names", NULL);
++}
++
+ static ofnode msm_spmi_bus0(struct udevice *dev)
+ {
+ 	ofnode node;
+ 
+ 	dev_for_each_subnode(node, dev)
+-		if (!ofnode_read_prop(node, "compatible", NULL) &&
+-		    ofnode_read_prop(node, "reg-names", NULL))
++		if (msm_spmi_is_bus(node))
+ 			return node;
+ 
+ 	return ofnode_null();
+ }
+ 
++/*
++ * The first bus is served by the arbiter device itself (its PMICs are bound
++ * as its children); every further bus becomes a "msm_spmi_bus" device.
++ */
+ static int msm_spmi_bind(struct udevice *dev)
+ {
+ 	ofnode bus = msm_spmi_bus0(dev);
+@@ -346,15 +359,60 @@ static int msm_spmi_bind(struct udevice *dev)
+ 			return ret;
+ 	}
+ 
++	for (node = ofnode_next_subnode(bus); ofnode_valid(node);
++	     node = ofnode_next_subnode(node)) {
++		if (!msm_spmi_is_bus(node))
++			continue;
++		ret = device_bind_driver_to_node(dev, "msm_spmi_bus",
++						 ofnode_get_name(node), node,
++						 NULL);
++		if (ret)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
++/* Map the PPIDs of the APIDs first .. first + count - 1 to their channels */
++static void msm_spmi_scan(struct msm_spmi_priv *priv, unsigned int first,
++			  unsigned int count)
++{
++	unsigned int i;
++
++	for (i = first; i < first + count; i++) {
++		uint32_t periph = readl(priv->arb_chnl + ARB_CHANNEL_OFFSET(i));
++		uint8_t slave_id = (periph & 0xf0000) >> 16;
++		uint8_t pid = (periph & 0xff00) >> 8;
++
++		if (priv->arb_ver == V8) {
++			if (!periph)
++				continue;
++			slave_id = (periph & SPMI_V8_PPID_MASK) >> 8;
++			pid = periph & 0xff;
++			if (slave_id >= SPMI_MAX_SLAVES)
++				continue;
++		}
++
++		switch (priv->arb_ver) {
++		case V2:
++		case V3:
++			priv->channel_map[slave_id][pid] = i | SPMI_CHANNEL_VALID;
++			break;
++
++		case V5:
++		case V7:
++		case V8:
++			msm_spmi_channel_map_v5(priv, i, slave_id, pid);
++			break;
++		}
++	}
++}
++
+ static int msm_spmi_probe(struct udevice *dev)
+ {
+ 	struct msm_spmi_priv *priv = dev_get_priv(dev);
+ 	phys_addr_t core_addr;
+ 	u32 hw_ver;
+-	int i;
+ 
+ 	core_addr = dev_read_addr_name(dev, "core");
+ 	priv->spmi_chnls = dev_read_addr_name(dev, "chnls");
+@@ -411,33 +469,65 @@ static int msm_spmi_probe(struct udevice *dev)
+ 	dev_dbg(dev, "priv->spmi_chnls address (%#08llx)\n", priv->spmi_chnls);
+ 	dev_dbg(dev, "priv->spmi_obs address (%#08llx)\n", priv->spmi_obs);
+ 	/* Scan peripherals connected to each SPMI channel */
+-	for (i = 0; i < priv->max_channels; i++) {
+-		uint32_t periph = readl(priv->arb_chnl + ARB_CHANNEL_OFFSET(i));
+-		uint8_t slave_id = (periph & 0xf0000) >> 16;
+-		uint8_t pid = (periph & 0xff00) >> 8;
++	msm_spmi_scan(priv, 0, priv->max_channels);
+ 
+-		if (priv->arb_ver == V8) {
+-			if (!periph)
+-				continue;
+-			slave_id = (periph & SPMI_V8_PPID_MASK) >> 8;
+-			pid = periph & 0xff;
+-			if (slave_id >= SPMI_MAX_SLAVES)
+-				continue;
+-		}
++	return 0;
++}
+ 
+-		switch (priv->arb_ver) {
+-		case V2:
+-		case V3:
+-			priv->channel_map[slave_id][pid] = i | SPMI_CHANNEL_VALID;
+-			break;
++/*
++ * A further bus of a v8 arbiter: it shares the arbiter's channel map and
++ * channels, its APIDs follow those of the buses before it (PMIC_ARB_FEATURES
++ * holds one APID count per bus), and it has its own channel owner table.
++ */
++static int msm_spmi_bus_probe(struct udevice *dev)
++{
++	struct udevice *arb = dev_get_parent(dev);
++	struct msm_spmi_priv *arb_priv = dev_get_priv(arb);
++	struct msm_spmi_priv *priv = dev_get_priv(dev);
++	unsigned int index = 0, count = 0, i;
++	phys_addr_t core_addr;
++	struct resource res;
++	ofnode node;
+ 
+-		case V5:
+-		case V7:
+-		case V8:
+-			msm_spmi_channel_map_v5(priv, i, slave_id, pid);
++	if (arb_priv->arb_ver != V8)
++		return -ENODEV;
++
++	dev_for_each_subnode(node, arb) {
++		if (ofnode_equal(node, dev_ofnode(dev)))
+ 			break;
+-		}
++		if (msm_spmi_is_bus(node))
++			index++;
++	}
++
++	core_addr = dev_read_addr_name(arb, "core");
++	if (core_addr == FDT_ADDR_T_NONE)
++		return -EINVAL;
++
++	priv->arb_ver = arb_priv->arb_ver;
++	priv->arb_chnl = arb_priv->arb_chnl;
++	priv->spmi_chnls = arb_priv->spmi_chnls;
++	priv->spmi_obs = arb_priv->spmi_obs;
++	priv->owner = arb_priv->owner;
++
++	priv->base_apid = 0;
++	for (i = 0; i <= index; i++) {
++		priv->base_apid += count;
++		count = readl(core_addr + PMIC_ARB_FEATURES + 4 * i) &
++			PMIC_ARB_FEATURES_V8_PERIPH_MASK;
+ 	}
++	if (!count || priv->base_apid + count > SPMI_MAX_CHANNELS_V8)
++		return -ENODEV;
++	priv->max_channels = count;
++
++	if (ofnode_read_resource_byname(dev_ofnode(dev), "chnl_owner", &res))
++		return -EINVAL;
++	priv->spmi_cnfg = res.start;
++
++	dev_dbg(dev, "bus %u: APIDs %u..%u\n", index, priv->base_apid,
++		priv->base_apid + count - 1);
++
++	msm_spmi_scan(priv, priv->base_apid, count);
++
+ 	return 0;
+ }
+ 
+@@ -456,3 +546,11 @@ U_BOOT_DRIVER(msm_spmi) = {
+ 	.probe = msm_spmi_probe,
+ 	.priv_auto = sizeof(struct msm_spmi_priv),
+ };
++
++U_BOOT_DRIVER(msm_spmi_bus) = {
++	.name = "msm_spmi_bus",
++	.id = UCLASS_SPMI,
++	.ops = &msm_spmi_ops,
++	.probe = msm_spmi_bus_probe,
++	.priv_auto = sizeof(struct msm_spmi_priv),
++};
+-- 
+2.43.0
+
