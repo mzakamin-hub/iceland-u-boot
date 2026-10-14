@@ -1,0 +1,450 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Wed, 14 Oct 2026 20:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: A power-on boot menu on the keys
+
+The Pad 4 is to start Fedora or, once the disk is split, LineageOS. ABL
+starts boot_b (U-Boot) in both cases; LineageOS's kernel goes into
+recovery_b, which ABL starts in recovery mode. The choice is a U-Boot
+bootmenu on the tablet's keys: Volume Up / Volume Down move, Power
+selects (button-kbd with the phone key remapping, already in the
+config). 5 s, then the default, Fedora.
+
+- mach-snapdragon: qcom_keys_released <s>: wait until no button is held
+  (200 ms), then drop the console's queue. button-kbd makes a character
+  when a key is released, so the power-on press would select an entry.
+  A key still held after <s>: the command fails, no menu.
+- mach-snapdragon: qcom_recovery_gate [if]: read only. Succeeds only when
+  exactly one disk has "userdata", the same disk has "fedora" (userdata
+  is Android's), and recovery_b starts with a boot image header v3 / v4
+  whose kernel is an arm64 Image. Until then no LineageOS entry exists,
+  so it is never offered while userdata holds Fedora.
+- mach-snapdragon: qcom_reboot_mode <recovery|bootloader>: store the
+  DT's mode-recovery / mode-bootloader in the nvmem-reboot-mode cell
+  (fastboot.c's store: read, modify, write, read back), then reset. If
+  the store fails, nothing is reset.
+- env: the menu runs after the disk is mapped. Entries: Fedora (leave
+  the menu), LineageOS (only when the gate is open), Boot loader
+  (fastboot). Not on a charger start (ABL boot mode "charger", patch
+  0011): Fedora at once, its charging target takes over, and no key can
+  start another OS. Every new line is install-only: the rehearsal env
+  is unchanged.
+- No U-Boot console: bootmenu runs only inside bootcmd, so its own
+  "Exit" line (and ESC) returns there and the boot goes on to Fedora,
+  like the timeout. BOOTMENU_DISABLE_UBOOT_CONSOLE is not set: it needs
+  AUTOBOOT_MENU_SHOW, which would run an EFI boot menu before bootcmd.
+
+U-Boot resets only for an entry the owner picked with Power, after the
+reboot reason was stored and read back. Volume Down at power-on still
+reaches ABL's fastboot before U-Boot runs.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ arch/arm/mach-snapdragon/Kconfig            |  12 ++
+ arch/arm/mach-snapdragon/Makefile           |   1 +
+ arch/arm/mach-snapdragon/boot_menu.c        | 224 ++++++++++++++++++++
+ arch/arm/mach-snapdragon/fastboot.c         |   4 +-
+ arch/arm/mach-snapdragon/qcom-reboot-mode.h |  15 ++
+ arch/arm/mach-snapdragon/reboot_mode_cmd.c  |  45 ++++
+ board/qualcomm/iceland.env                  |  20 +-
+ configs/iceland_defconfig                   |   1 +
+ 8 files changed, 320 insertions(+), 2 deletions(-)
+ create mode 100644 arch/arm/mach-snapdragon/boot_menu.c
+ create mode 100644 arch/arm/mach-snapdragon/qcom-reboot-mode.h
+ create mode 100644 arch/arm/mach-snapdragon/reboot_mode_cmd.c
+
+diff --git a/arch/arm/mach-snapdragon/Kconfig b/arch/arm/mach-snapdragon/Kconfig
+index 9dd0fdf7..49c1d819 100644
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -53,4 +53,16 @@ config QCOM_ABL_BOOT_MODE
+ 	  /chosen as u-boot,abl-boot-mode. Read only. Lets the OS tell an
+ 	  off-mode charging start (USB cable power-on) from a normal one.
+ 
++config QCOM_BOOT_MENU
++	bool "Commands for a power-on boot menu on the device's keys"
++	depends on CMDLINE && BUTTON && BLK && PARTITIONS && FASTBOOT && MISC
++	help
++	  qcom_keys_released waits until no button is held and drops the
++	  console's queued input, so the power-on press cannot select a
++	  bootmenu entry. qcom_recovery_gate (read only) succeeds when the
++	  userdata disk also has a "fedora" partition and recovery_b holds
++	  an Android boot image with an arm64 kernel. qcom_reboot_mode
++	  stores ABL's reboot reason (recovery or bootloader) in the DT's
++	  nvmem-reboot-mode cell, reads it back and resets.
++
+ endif
+diff --git a/arch/arm/mach-snapdragon/Makefile b/arch/arm/mach-snapdragon/Makefile
+index b76f44a2..730c46df 100644
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -5,5 +5,6 @@
+ obj-y += board.o
+ obj-$(CONFIG_FASTBOOT) += fastboot.o
+ obj-$(CONFIG_QCOM_ABL_BOOT_MODE) += abl_boot_mode.o
++obj-$(CONFIG_QCOM_BOOT_MENU) += boot_menu.o reboot_mode_cmd.o
+ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ obj-$(CONFIG_OF_LIVE) += of_fixup.o
+diff --git a/arch/arm/mach-snapdragon/boot_menu.c b/arch/arm/mach-snapdragon/boot_menu.c
+new file mode 100644
+index 00000000..2b81a1df
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/boot_menu.c
+@@ -0,0 +1,224 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Helpers for a power-on boot menu on Qualcomm phones and tablets that the
++ * Android boot loader (ABL) starts from boot_b, driven by the device's keys
++ * (button-kbd: Volume Up / Volume Down / Power). Both commands only read.
++ *
++ * qcom_keys_released <seconds>
++ *	Wait until no button reads pressed for 200 ms, then drop every
++ *	character the console has queued. button-kbd turns a key into a
++ *	character when the key is released, so the press that powered the
++ *	device on would otherwise select a menu entry. Fails (and drops the
++ *	queue as well) if a button is still held after <seconds>.
++ *
++ * qcom_recovery_gate [interface]
++ *	Succeeds only when the recovery_b partition can start another OS:
++ *	exactly one block device of <interface> (default scsi) has a
++ *	"userdata" partition, the same device also has a "fedora" partition
++ *	(the disk is split, userdata is Android's), exactly one device has a
++ *	"recovery_b" partition, and that partition starts with an Android boot
++ *	image header v3 / v4 whose kernel is an arm64 Image. Reads two 4 KiB
++ *	pages of recovery_b and the partition tables, writes nothing.
++ */
++
++#include <blk.h>
++#include <button.h>
++#include <command.h>
++#include <console.h>
++#include <cyclic.h>
++#include <dm.h>
++#include <malloc.h>
++#include <memalign.h>
++#include <part.h>
++#include <stdio.h>
++#include <time.h>
++#include <vsprintf.h>
++#include <asm/unaligned.h>
++#include <dm/device-internal.h>
++#include <linux/delay.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++
++#define QCOM_KEYS_QUIET_MS	200
++#define QCOM_GATE_MAX_DEVS	16
++#define QCOM_BOOT_PAGE		4096	/* boot image header v3 / v4: fixed 4 KiB pages */
++#define QCOM_ARM64_MAGIC	0x644d5241	/* "ARM\x64" at offset 0x38 of an arm64 Image */
++
++/* the number of labelled buttons that read pressed (a button that cannot be probed is skipped) */
++static int qcom_buttons_pressed(void)
++{
++	struct udevice *dev;
++	struct uclass *uc;
++	int n = 0;
++
++	uclass_id_foreach_dev(UCLASS_BUTTON, dev, uc) {
++		struct button_uc_plat *plat = dev_get_uclass_plat(dev);
++
++		if (!plat || !plat->label || device_probe(dev))
++			continue;
++		if (button_get_state(dev) == BUTTON_ON)
++			n++;
++	}
++
++	return n;
++}
++
++/* drop what the console has queued; reading also polls button-kbd, which queues released keys */
++static void qcom_console_drain(void)
++{
++	int n;
++
++	for (n = 0; n < 1024 && tstc(); n++)
++		getchar();
++}
++
++static int do_qcom_keys_released(struct cmd_tbl *cmdtp, int flag, int argc,
++				 char *const argv[])
++{
++	ulong limit, start, quiet;
++	bool told = false;
++
++	if (argc != 2)
++		return CMD_RET_USAGE;
++	limit = dectoul(argv[1], NULL);
++	if (!limit || limit > 60)
++		return CMD_RET_USAGE;
++	limit *= 1000;
++
++	start = get_timer(0);
++	quiet = start;
++	for (;;) {
++		qcom_console_drain();
++		if (qcom_buttons_pressed()) {
++			quiet = get_timer(0);
++			if (!told)
++				printf("=== waiting for the keys to be released ===\n");
++			told = true;
++		} else if (get_timer(quiet) >= QCOM_KEYS_QUIET_MS) {
++			qcom_console_drain();
++			return CMD_RET_SUCCESS;
++		}
++		if (get_timer(start) >= limit) {
++			qcom_console_drain();
++			printf("=== a key is still held after %lu s ===\n", limit / 1000);
++			return CMD_RET_FAILURE;
++		}
++		schedule();
++		mdelay(10);
++	}
++}
++
++/* exactly one device of @iface has a partition @name: 0, -ENOENT (none), -EEXIST (more) */
++static int qcom_find_part(const char *iface, const char *name,
++			  struct blk_desc **descp, struct disk_partition *info)
++{
++	struct disk_partition p;
++	struct blk_desc *desc;
++	int i, found = 0;
++
++	for (i = 0; i < QCOM_GATE_MAX_DEVS; i++) {
++		desc = blk_get_devnum_by_uclass_idname(iface, i);
++		if (!desc || desc->type == DEV_TYPE_UNKNOWN || !desc->blksz ||
++		    device_probe(desc->bdev))
++			continue;
++		if (part_get_info_by_name(desc, name, &p) < 0)
++			continue;
++		if (found++)
++			return -EEXIST;
++		*descp = desc;
++		*info = p;
++	}
++
++	return found ? 0 : -ENOENT;
++}
++
++/*
++ * NULL when @b (the first two 4 KiB pages of a partition of @part_bytes) is a
++ * boot image header v3 / v4 with an arm64 kernel, else the reason
++ */
++static const char *qcom_recovery_check(const u8 *b, u64 part_bytes)
++{
++	u32 ksize = get_unaligned_le32(b + 8);
++	u32 version = get_unaligned_le32(b + 40);
++
++	if (memcmp(b, "ANDROID!", 8))
++		return "no Android boot image";
++	if (version != 3 && version != 4)
++		return "not a boot image header v3 / v4";
++	if (ksize < 0x40)
++		return "no kernel in the image";
++	if ((u64)QCOM_BOOT_PAGE + ksize > part_bytes)
++		return "kernel larger than the partition";
++	if (get_unaligned_le32(b + QCOM_BOOT_PAGE + 0x38) != QCOM_ARM64_MAGIC)
++		return "the kernel is not an arm64 Image";
++
++	return NULL;
++}
++
++static int do_qcom_recovery_gate(struct cmd_tbl *cmdtp, int flag, int argc,
++				 char *const argv[])
++{
++	const char *iface = argc > 1 ? argv[1] : "scsi";
++	struct disk_partition ud, fd, rb;
++	struct blk_desc *udesc, *fdesc, *rdesc;
++	const char *why = NULL;
++	lbaint_t nblk;
++	u8 *buf;
++	int ret;
++
++	if (argc > 2)
++		return CMD_RET_USAGE;
++
++	ret = qcom_find_part(iface, "userdata", &udesc, &ud);
++	if (ret) {
++		printf("=== recovery gate: %s userdata partition: closed ===\n",
++		       ret == -EEXIST ? "more than one" : "no");
++		return CMD_RET_FAILURE;
++	}
++	ret = qcom_find_part(iface, "fedora", &fdesc, &fd);
++	if (ret || fdesc != udesc) {
++		printf("=== recovery gate: %s: closed ===\n",
++		       ret == -ENOENT ? "no fedora partition (userdata holds Fedora)" :
++		       ret ? "more than one fedora partition" :
++		       "the fedora partition is not on the userdata disk");
++		return CMD_RET_FAILURE;
++	}
++	ret = qcom_find_part(iface, "recovery_b", &rdesc, &rb);
++	if (ret) {
++		printf("=== recovery gate: %s recovery_b partition: closed ===\n",
++		       ret == -EEXIST ? "more than one" : "no");
++		return CMD_RET_FAILURE;
++	}
++
++	nblk = DIV_ROUND_UP(2 * QCOM_BOOT_PAGE, rdesc->blksz);
++	if (rb.size < nblk) {
++		printf("=== recovery gate: recovery_b is too small: closed ===\n");
++		return CMD_RET_FAILURE;
++	}
++	buf = memalign(ARCH_DMA_MINALIGN, nblk * rdesc->blksz);
++	if (!buf)
++		return CMD_RET_FAILURE;
++	if (blk_dread(rdesc, rb.start, nblk, buf) != nblk)
++		why = "recovery_b cannot be read";
++	else
++		why = qcom_recovery_check(buf, (u64)rb.size * rdesc->blksz);
++	if (!why)
++		printf("%s (%u bytes): open ===\n",
++		       "=== recovery gate: fedora next to userdata, recovery_b holds an Android kernel",
++		       get_unaligned_le32(buf + 8));
++	free(buf);
++	if (why) {
++		printf("=== recovery gate: recovery_b: %s: closed ===\n", why);
++		return CMD_RET_FAILURE;
++	}
++
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(qcom_keys_released, 2, 0, do_qcom_keys_released,
++	   "wait until no key is held, then drop queued console input",
++	   "<seconds>  - fails if a key is still held after <seconds> (1-60)");
++
++U_BOOT_CMD(qcom_recovery_gate, 2, 0, do_qcom_recovery_gate,
++	   "check that recovery_b can start another OS (read only)",
++	   "[interface]  - default scsi: userdata + fedora on one disk, an Android kernel in recovery_b");
+diff --git a/arch/arm/mach-snapdragon/fastboot.c b/arch/arm/mach-snapdragon/fastboot.c
+index 25afdd72..d6eae979 100755
+--- a/arch/arm/mach-snapdragon/fastboot.c
++++ b/arch/arm/mach-snapdragon/fastboot.c
+@@ -15,7 +15,9 @@
+ #include <linux/bitops.h>
+ #include <dm/ofnode.h>
+ 
+-static int qcom_reboot_mode_store(const char *mode_prop)
++#include "qcom-reboot-mode.h"
++
++int qcom_reboot_mode_store(const char *mode_prop)
+ {
+ 	ofnode node = ofnode_by_compatible(ofnode_null(), "nvmem-reboot-mode");
+ 	struct ofnode_phandle_args args;
+diff --git a/arch/arm/mach-snapdragon/qcom-reboot-mode.h b/arch/arm/mach-snapdragon/qcom-reboot-mode.h
+new file mode 100644
+index 00000000..3117ef06
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/qcom-reboot-mode.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/* Store a reboot mode of the DT's nvmem-reboot-mode node for ABL (fastboot.c) */
++#ifndef __QCOM_REBOOT_MODE_H
++#define __QCOM_REBOOT_MODE_H
++
++/**
++ * qcom_reboot_mode_store() - store a reboot mode in the nvmem-reboot-mode cell
++ * @mode_prop: the mode property of the node, e.g. "mode-bootloader"
++ *
++ * Reads the cell, modifies its bit field, writes it and reads it back.
++ * Return: 0 when the value read back is the mode, a negative error otherwise.
++ */
++int qcom_reboot_mode_store(const char *mode_prop);
++
++#endif
+diff --git a/arch/arm/mach-snapdragon/reboot_mode_cmd.c b/arch/arm/mach-snapdragon/reboot_mode_cmd.c
+new file mode 100644
+index 00000000..499d4a98
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/reboot_mode_cmd.c
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * qcom_reboot_mode <recovery|bootloader>: reset into the Android boot
++ * loader's (ABL) recovery or fastboot mode. The DT's mode-recovery /
++ * mode-bootloader value is stored in the nvmem-reboot-mode cell and read
++ * back first (the path of `fastboot reboot-bootloader`, fastboot.c); if that
++ * fails, nothing is reset and the command fails.
++ */
++
++#include <command.h>
++#include <stdio.h>
++#include <linux/string.h>
++
++#include "qcom-reboot-mode.h"
++
++static int do_qcom_reboot_mode(struct cmd_tbl *cmdtp, int flag, int argc,
++			       char *const argv[])
++{
++	const char *prop;
++	int ret;
++
++	if (argc != 2)
++		return CMD_RET_USAGE;
++	if (!strcmp(argv[1], "recovery"))
++		prop = "mode-recovery";
++	else if (!strcmp(argv[1], "bootloader"))
++		prop = "mode-bootloader";
++	else
++		return CMD_RET_USAGE;
++
++	ret = qcom_reboot_mode_store(prop);
++	if (ret) {
++		printf("=== reboot mode %s NOT stored (%d): no reset ===\n", argv[1], ret);
++		return CMD_RET_FAILURE;
++	}
++
++	printf("=== reset: the boot loader starts in %s mode ===\n", argv[1]);
++	do_reset(NULL, 0, 0, NULL);
++
++	return CMD_RET_FAILURE;
++}
++
++U_BOOT_CMD(qcom_reboot_mode, 2, 0, do_qcom_reboot_mode,
++	   "reset into the boot loader's recovery or fastboot mode",
++	   "recovery|bootloader");
+diff --git a/board/qualcomm/iceland.env b/board/qualcomm/iceland.env
+index 53bab1df..55540a9a 100644
+--- a/board/qualcomm/iceland.env
++++ b/board/qualcomm/iceland.env
+@@ -42,7 +42,25 @@ fedora_bootopt=if test -n "${bdev}" && part start blkmap ${bdev} 1 esp_start; th
+ # The one `scsi scan` of a boot is here; userdata_blkmap runs only after it (no second scan of the UFS).
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ fedora_blkmap=scsi scan && part start scsi 0 fedora fd_start && part size scsi 0 fedora fd_size && blkmap create fedora && blkmap map fedora 0 ${fd_size} linear scsi 0 ${fd_start}
++# The power-on menu (patch 0012), after the disk is mapped: Volume Up / Volume Down move, Power selects (button-kbd
++# makes the character when a key is RELEASED). 5 s, then the default: Fedora. "Fedora", the menu's "Exit" line and
++# ESC leave the menu and the boot goes on as before (bootmenu runs only inside bootcmd: there is no U-Boot console). "LineageOS" only when qcom_recovery_gate is open (read only: the userdata
++# LUN also has a "fedora" partition, so userdata is Android's, and recovery_b holds an Android boot image with an
++# arm64 kernel): store the reboot reason "recovery" for ABL, read it back, reset; ABL starts recovery_b.
++# "Boot loader (fastboot)": the same with "bootloader" (patch 0010's reboot-bootloader store). If a store fails,
++# nothing is reset and Fedora boots. qcom_keys_released first waits until no key is held (up to 10 s: the power-on
++# press must not select) and drops queued key characters; a key still held then: no menu, Fedora.
++# A charger start (ABL boot mode "charger", patch 0011): no menu, Fedora at once (its charging target takes over),
++# so a key held at a cable power-on can never start another OS.
++# ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
++bootmenu_delay=5
++# ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
++menu_keys_timeout=10
++# ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
++menu_setup=setenv bootmenu_0 "Fedora=true"; if qcom_recovery_gate scsi; then setenv bootmenu_1 "LineageOS=qcom_reboot_mode recovery"; setenv bootmenu_2 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; else setenv bootmenu_1 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; setenv bootmenu_2; fi; setenv bootmenu_3; setenv bootmenu_default 0
++# ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
++menu_run=if test "${abl_boot_mode}" = charger; then echo "=== charger start (ABL boot mode charger): no menu, Fedora ==="; elif qcom_keys_released ${menu_keys_timeout}; then run menu_setup; bootmenu ${bootmenu_delay}; else echo "=== a key is still held: no menu, Fedora ==="; fi
+ # One boot command for both layouts: a "fedora" partition wins (dual boot); otherwise userdata holds the
+ # Fedora disk (single boot). If nothing boots, fall back to fastboot (RAM boot only; flashing is compiled out).
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+-bootcmd=if run fedora_blkmap; then echo "booting Fedora from the fedora partition"; else run userdata_blkmap; fi; if blkmap get fedora dev bdev; then true; else blkmap get userdata dev bdev; fi; run fedora_bootopt; bootefi bootmgr; run fastboot_loop
++bootcmd=if run fedora_blkmap; then echo "booting Fedora from the fedora partition"; else run userdata_blkmap; fi; run menu_run; if blkmap get fedora dev bdev; then true; else blkmap get userdata dev bdev; fi; run fedora_bootopt; bootefi bootmgr; run fastboot_loop
+diff --git a/configs/iceland_defconfig b/configs/iceland_defconfig
+index 26996129..548049dc 100644
+--- a/configs/iceland_defconfig
++++ b/configs/iceland_defconfig
+@@ -10,6 +10,7 @@ CONFIG_PHY_QCOM_M31_EUSB2=y
+ CONFIG_PHY_QCOM_EUSB2_REPEATER=y
+ CONFIG_QCOM_SPMI_SDAM=y
+ CONFIG_QCOM_ABL_BOOT_MODE=y
++CONFIG_QCOM_BOOT_MENU=y
+ # CONFIG_QCOM_RPMH_POWER_DOMAIN is not set
+ CONFIG_USB_FUNCTION_FASTBOOT=y
+ # 1 GiB download buffer in the 9 GiB RAM bank (a rehearsal head is a few hundred MB of gzip)
+-- 
+2.43.0
+
