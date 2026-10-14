@@ -8,7 +8,7 @@ as the OnePlus 15 (infiniti-mainline). Kept as a patch queue on an upstream tag;
 | `uboot.pin` | upstream tag, infiniti commit, expected tree hashes, mkbootimg pin, boot header values |
 | `patches/0001-infiniti/` | infiniti-mainline/u-boot `main` (14 commits: Kaanapali clocks, eUSB2, PMIC arb v8, ABL memory map pass-through, EFI from userdata, OnePlus 15) |
 | `patches/0002-iceland/` | OnePlus Pad 4 board (DTS, `iceland_defconfig`, `iceland.env`; 0001-0003) + the install build (0004-0010, see below) |
-| `tools/install/` | build / check tooling and RAM-boot probes of the install build |
+| `tools/install/` | `BUILD_INFO-v3.txt` / `SHA256SUMS-v3.txt`: the record of the tested v3 build |
 | `scripts/prepare.sh` / `scripts/build.sh` | source tree with verified hashes / U-Boot + boot images |
 
 ```
@@ -17,17 +17,6 @@ scripts/prepare.sh ./src && scripts/build.sh ./src ./out
 
 Boot flow: ABL → `boot_a` = U-Boot → `bootefi bootmgr` on the disk image in `userdata` (ESP → systemd-boot/GRUB
 → Linux with `dtb/qcom/kaanapali-oneplus-iceland.dtb`) → falls back to `fastboot usb 0`.
-
-## First test (RAM only — nothing is written)
-With the tablet in fastboot mode (Power + Volume Down), the user runs:
-```
-fastboot boot u-boot-iceland-v4.img      # if ABL refuses: fastboot boot u-boot-iceland-v2.img
-```
-Expected: U-Boot text on the panel (ABL framebuffer), then — with no disk image in userdata yet — U-Boot's own
-fastboot (`fastboot devices` lists it). Report what the screen shows. Reboot (hold Power) returns to stock.
-
-Open questions this test answers: RAM boot allowed by OnePlus ABL? header v4 vs v2? framebuffer geometry
-(3392x2400, stride 13568)? UFS/GPT visible (`part list scsi 0`)?
 
 Licence: GPL-2.0+ (U-Boot `Licenses/`). Boot image header values must match stock (`uboot.pin`).
 
@@ -72,17 +61,6 @@ hash footer made from that day's boot_b, so its footered hash is not listed):
 
 A rebuild with `scripts/build.sh` gives the same source tree but not the same image hash (U-Boot embeds its
 build time).
-
-`tools/install/` - the PC workflow's build and check tooling (written for the project's WSL layout,
-`~/mainline/build/wf/...`; kept as the record of how v3 was built and checked: 189 checks, 0 failures,
-`check-v3.txt`): `mk-uboot-v3.sh` (the three variants from one tree + all checks), `check-usb-src.py` (0009
-against the Linux DT and drivers), `check-reboot-src.py` (0010), `check-usbcold-env.py` (allow list of the
-diagnostic's register writes), `check-header.py` (boot header vs the day's boot_b), `sandbox-check-loop.sh` /
-`sandbox-check-usbcold.sh` (the env scripts in a U-Boot sandbox), `spmi-unit/` and `rb-unit/` (host unit tests of
-spmi-msm.c against a two-bus v8 arbiter model and of 0010 against a PMK8850 model), `usbcold-extra.env`, and the
-RAM-boot probes `uboot-ram-probe.ps1`, `usbcold-ram-probe.ps1`, `rb-ram-probe.ps1` with `check-probe.py` /
-`check-probe-rb.py` (their fastboot / adb whitelists: boot, getvar, devices, `oem console`, reboot,
-reboot-bootloader only).
 
 Still open: marking slot b successful from Fedora (`qbootctl -m`; U-Boot writes no GPT) and the install-flow
 rehearsal with this U-Boot. Writes to the tablet are always run by the owner.
