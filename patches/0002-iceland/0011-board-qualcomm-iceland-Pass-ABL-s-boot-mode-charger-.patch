@@ -1,0 +1,502 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: Pass ABL's boot mode (charger) on
+ to the OS
+
+With a USB cable in, a powered-off Pad 4 is powered on again by VBUS.
+ABL then starts the boot partition in its off-mode charging mode (stock:
+Android's charging screen) and says so in the DT it hands over:
+"androidboot.mode=charger" in the bootconfig block at the end of the
+ramdisk (boot image header v4; header v3 and older: in bootargs), and,
+on OnePlus ABLs, "oplusboot.mode=<mode>" in /chosen bootargs (normal,
+reboot, charger, ...; the stock kernel's oplus_bsp_bootmode parses it).
+U-Boot boots its OS itself over EFI, so the OS never sees any of this:
+Fedora came up with its desktop on every cable power-on.
+
+Read the three sources once, early in board_late_init() (before U-Boot
+loads anything into RAM), from ABL's DT (get_prev_bl_fdt_addr()):
+bootargs, and the bootconfig block found through /chosen
+linux,initrd-start / -end (trailer as the kernel reads it: size,
+byte-sum checksum, "#BOOTCONFIG\n", up to 3 bytes of padding). Only
+memory inside U-Boot's DRAM banks is read. A value is used only if it
+is [a-z0-9_-]{1,15}. "charger" from any source wins; otherwise the
+first source that has a value; otherwise "unknown".
+
+The result goes into ${abl_boot_mode}, one console line ("ABL boot
+mode: ...", readable with `fastboot oem console`), and the OS's DT:
+ft_board_setup() adds /chosen u-boot,abl-boot-mode (the mode) and
+u-boot,abl-boot-mode-source (what each source said). The EFI boot
+manager applies ft_board_setup() to the DT it loads from the ESP, so
+Linux finds the mode in /proc/device-tree/chosen/.
+
+Read only: nothing is written but U-Boot's environment and the OS's DT.
+Every failure is logged and ignored; the boot itself is unchanged.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ arch/arm/mach-snapdragon/Kconfig         |  11 +
+ arch/arm/mach-snapdragon/Makefile        |   1 +
+ arch/arm/mach-snapdragon/abl-boot-mode.h |  20 ++
+ arch/arm/mach-snapdragon/abl_boot_mode.c | 331 +++++++++++++++++++++++
+ arch/arm/mach-snapdragon/board.c         |   4 +
+ arch/arm/mach-snapdragon/of_fixup.c      |   5 +
+ configs/iceland_defconfig                |   1 +
+ 7 files changed, 373 insertions(+)
+ create mode 100644 arch/arm/mach-snapdragon/abl-boot-mode.h
+ create mode 100644 arch/arm/mach-snapdragon/abl_boot_mode.c
+
+diff --git a/arch/arm/mach-snapdragon/Kconfig b/arch/arm/mach-snapdragon/Kconfig
+index d3de8693..9dd0fdf7 100644
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -42,4 +42,15 @@ config SYS_CONFIG_NAME
+ 	  Based on this option include/configs/<CONFIG_SYS_CONFIG_NAME>.h header
+ 	  will be used for board configuration.
+ 
++config QCOM_ABL_BOOT_MODE
++	bool "Pass the Android boot loader's boot mode on to the OS"
++	depends on OF_LIBFDT && OF_BOARD_SETUP && OF_LIVE
++	help
++	  Read the boot mode the previous boot loader (ABL) put into the DT
++	  it handed over (oplusboot.mode= / androidboot.mode= in /chosen
++	  bootargs, androidboot.mode in the bootconfig block at the end of
++	  its ramdisk), store it in ${abl_boot_mode} and add it to the OS's
++	  /chosen as u-boot,abl-boot-mode. Read only. Lets the OS tell an
++	  off-mode charging start (USB cable power-on) from a normal one.
++
+ endif
+diff --git a/arch/arm/mach-snapdragon/Makefile b/arch/arm/mach-snapdragon/Makefile
+index ec720058..b76f44a2 100644
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -4,5 +4,6 @@
+ 
+ obj-y += board.o
+ obj-$(CONFIG_FASTBOOT) += fastboot.o
++obj-$(CONFIG_QCOM_ABL_BOOT_MODE) += abl_boot_mode.o
+ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ obj-$(CONFIG_OF_LIVE) += of_fixup.o
+diff --git a/arch/arm/mach-snapdragon/abl-boot-mode.h b/arch/arm/mach-snapdragon/abl-boot-mode.h
+new file mode 100644
+index 00000000..ffbcf9c6
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/abl-boot-mode.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * The Android boot loader's boot mode, passed on to the OS (abl_boot_mode.c).
++ * Its own header: qcom-priv.h defines a function body when capsule updates
++ * are off and can be included by only one file.
++ */
++#ifndef __QCOM_ABL_BOOT_MODE_H__
++#define __QCOM_ABL_BOOT_MODE_H__
++
++#include <linux/kconfig.h>
++
++#if IS_ENABLED(CONFIG_QCOM_ABL_BOOT_MODE)
++void qcom_abl_boot_mode_init(void);
++void qcom_abl_boot_mode_fixup(void *blob);
++#else
++static inline void qcom_abl_boot_mode_init(void) {}
++static inline void qcom_abl_boot_mode_fixup(void *blob) {}
++#endif
++
++#endif /* __QCOM_ABL_BOOT_MODE_H__ */
+diff --git a/arch/arm/mach-snapdragon/abl_boot_mode.c b/arch/arm/mach-snapdragon/abl_boot_mode.c
+new file mode 100644
+index 00000000..2e57d704
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/abl_boot_mode.c
+@@ -0,0 +1,331 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Pass the Android boot loader's boot mode on to the OS (read only).
++ *
++ * The Qualcomm ABL decides at power-on whether a start is an "off-mode
++ * charging" start (VBUS powered the PMIC on: cold boot, no power key, a
++ * charger present) and tells the boot image so. It does that in the DT it
++ * hands over in x0 (saved by save_boot_params(), get_prev_bl_fdt_addr()):
++ *
++ *  - boot image header v4: "androidboot.mode=charger" goes into the
++ *    bootconfig block that ABL appends to the ramdisk it loads; the DT's
++ *    /chosen linux,initrd-start / linux,initrd-end bound that ramdisk and
++ *    the block ends with "#BOOTCONFIG\n" (size, checksum and magic, as the
++ *    kernel's init/main.c reads it);
++ *  - header v3 and older: the same string in /chosen bootargs;
++ *  - OnePlus ABLs: "oplusboot.mode=<mode>" in /chosen bootargs as well
++ *    ("normal", "reboot", "charger", "recovery", ...).
++ *
++ * A U-Boot chainloaded by ABL boots its OS itself (EFI), so the OS never
++ * sees any of this. qcom_abl_boot_mode_init() reads the three sources once,
++ * early in board_late_init() (before U-Boot loads anything into RAM), and
++ * stores the result in ${abl_boot_mode}. qcom_abl_boot_mode_fixup() is
++ * called from ft_board_setup() and adds two strings to the OS's /chosen:
++ *
++ *   u-boot,abl-boot-mode         "charger", "normal", ... or "unknown"
++ *   u-boot,abl-boot-mode-source  what each source said, for the logs
++ *
++ * Nothing here writes anything but U-Boot's environment and the OS's DT
++ * (and the console). Every failure is logged and ignored: it must never
++ * stop a boot. Memory outside U-Boot's DRAM banks is never read.
++ */
++
++#ifndef ABL_BM_HOSTTEST
++#include <asm/global_data.h>
++#include <env.h>
++#include <fdt_support.h>
++#include <init.h>
++#include <linux/kernel.h>
++#include <linux/libfdt.h>
++#include <linux/string.h>
++#include <log.h>
++#include <vsprintf.h>
++#include "abl-boot-mode.h"
++
++DECLARE_GLOBAL_DATA_PTR;
++#endif
++
++#define ABL_BM_LEN		16
++#define BOOTCONFIG_MAGIC	"#BOOTCONFIG\n"
++#define BOOTCONFIG_MAGIC_LEN	12
++#define BOOTCONFIG_MAX		32767	/* XBC_DATA_MAX */
++#define BOOTCONFIG_TRAILER	(8 + BOOTCONFIG_MAGIC_LEN)
++
++struct abl_boot_mode {
++	char oplus[ABL_BM_LEN];		/* oplusboot.mode= in bootargs */
++	char bootconfig[ABL_BM_LEN];	/* androidboot.mode in the bootconfig block */
++	char cmdline[ABL_BM_LEN];	/* androidboot.mode= in bootargs */
++	const char *bootconfig_state;	/* why there is no bootconfig value */
++	char mode[ABL_BM_LEN];		/* the result */
++	char source[160];
++	int done;
++};
++
++#ifndef ABL_BM_HOSTTEST
++/* in .data: board_late_init() runs after relocation, but keep it out of the BSS clearing anyway */
++static struct abl_boot_mode abl_bm __section(".data");
++#endif
++
++static int abl_bm_valchar(char c)
++{
++	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
++}
++
++/*
++ * copy a mode value up to the end, a blank or a NUL: [a-z0-9_-]{1,15}, or the
++ * value is not used at all (any other character, or too long)
++ */
++static void abl_bm_copy(char *dst, const char *p, const char *end)
++{
++	int n = 0;
++
++	while (p < end && *p != ' ' && *p != '\t' && *p != '\0') {
++		if (!abl_bm_valchar(*p) || n == ABL_BM_LEN - 1) {
++			n = 0;
++			break;
++		}
++		dst[n++] = *p++;
++	}
++	dst[n] = '\0';
++}
++
++/* the value of " key=" in a kernel command line (the last one wins, as in the kernel) */
++static void abl_bm_cmdline(const char *cmdline, int len, const char *key, char *dst)
++{
++	int klen = strlen(key);
++	const char *end = cmdline + len;
++	const char *p;
++
++	dst[0] = '\0';
++	for (p = cmdline; p + klen <= end; p++) {
++		if (p != cmdline && p[-1] != ' ' && p[-1] != '\t')
++			continue;
++		if (!memcmp(p, key, klen))
++			abl_bm_copy(dst, p + klen, end);
++	}
++}
++
++static int abl_bm_space(char c)
++{
++	return c == ' ' || c == '\t';
++}
++
++/*
++ * androidboot.mode in a bootconfig text: lines "key = value" or "key=value",
++ * the value optionally quoted; '#' starts a comment, ';' or '\n' ends an entry.
++ * The last one wins.
++ */
++static void abl_bm_bootconfig_text(const char *s, int len, char *dst)
++{
++	static const char key[] = "androidboot.mode";
++	const char *end = s + len, *p = s;
++	int klen = sizeof(key) - 1;
++
++	dst[0] = '\0';
++	while (p < end) {
++		const char *e = p, *q;
++
++		while (e < end && *e != '\n' && *e != ';' && *e != '\0')
++			e++;
++		q = p;
++		while (q < e && (abl_bm_space(*q) || *q == '\r'))
++			q++;
++		if (e - q > klen && !memcmp(q, key, klen) &&
++		    (abl_bm_space(q[klen]) || q[klen] == '=')) {
++			q += klen;
++			while (q < e && abl_bm_space(*q))
++				q++;
++			if (q < e && *q == '=') {
++				q++;
++				while (q < e && abl_bm_space(*q))
++					q++;
++				if (q < e && (*q == '"' || *q == '\'')) {
++					char quote = *q++;
++					const char *v = q;
++
++					while (q < e && *q != quote)
++						q++;
++					if (q < e)
++						abl_bm_copy(dst, v, q);
++					else
++						dst[0] = '\0';
++				} else {
++					const char *v = q;
++
++					while (q < e && !abl_bm_space(*q) && *q != '#' &&
++					       *q != '\r')
++						q++;
++					abl_bm_copy(dst, v, q);
++				}
++			}
++		}
++		p = e + 1;
++	}
++}
++
++static unsigned int abl_bm_le32(const unsigned char *p)
++{
++	return p[0] | p[1] << 8 | p[2] << 16 | (unsigned int)p[3] << 24;
++}
++
++/*
++ * The bootconfig block at the end of the ramdisk [start, end): data, le32 size,
++ * le32 checksum (byte sum), "#BOOTCONFIG\n"; the magic may sit up to 3 bytes
++ * before the end (a ramdisk padded to 4 bytes), as the kernel allows.
++ * mem_ok(start, size) says whether that much RAM may be read.
++ */
++static const char *abl_bm_bootconfig(unsigned long start, unsigned long end,
++				     int (*mem_ok)(unsigned long, unsigned long), char *dst)
++{
++	unsigned long lo, magic;
++	const unsigned char *hdr;
++	unsigned int size, csum, sum = 0, i;
++	int k;
++
++	dst[0] = '\0';
++	if (!start || !end)
++		return "no ramdisk in ABL's /chosen";
++	if (end <= start || end - start < BOOTCONFIG_TRAILER)
++		return "ramdisk too small";
++	lo = end - start > BOOTCONFIG_MAX + BOOTCONFIG_TRAILER + 3 ?
++		end - (BOOTCONFIG_MAX + BOOTCONFIG_TRAILER + 3) : start;
++	if (!mem_ok(lo, end - lo))
++		return "ramdisk end outside U-Boot's RAM";
++	for (k = 0, magic = 0; k < 4 && end - k - BOOTCONFIG_MAGIC_LEN >= start + 8; k++) {
++		if (!memcmp((const void *)(end - k - BOOTCONFIG_MAGIC_LEN), BOOTCONFIG_MAGIC,
++			    BOOTCONFIG_MAGIC_LEN)) {
++			magic = end - k - BOOTCONFIG_MAGIC_LEN;
++			break;
++		}
++	}
++	if (!magic)
++		return "no bootconfig magic";
++	hdr = (const unsigned char *)(magic - 8);
++	size = abl_bm_le32(hdr);
++	csum = abl_bm_le32(hdr + 4);
++	if (!size || size > BOOTCONFIG_MAX || (unsigned long)hdr - start < size ||
++	    (unsigned long)hdr - size < lo)
++		return "bad bootconfig size";
++	for (i = 0; i < size; i++)
++		sum += hdr[(long)i - (long)size];
++	if (sum != csum)
++		return "bootconfig checksum mismatch";
++	abl_bm_bootconfig_text((const char *)hdr - size, size, dst);
++	return dst[0] ? NULL : "no androidboot.mode in the bootconfig";
++}
++
++static unsigned long abl_bm_addr_prop(const void *fdt, int node, const char *name)
++{
++	const unsigned char *p;
++	int len;
++
++	p = fdt_getprop(fdt, node, name, &len);
++	if (!p)
++		return 0;
++	if (len == 8)
++		return (unsigned long)((unsigned long long)fdt32_to_cpu(*(const fdt32_t *)p) << 32 |
++				       fdt32_to_cpu(*(const fdt32_t *)(p + 4)));
++	if (len == 4)
++		return fdt32_to_cpu(*(const fdt32_t *)p);
++	return 0;
++}
++
++/* read the three sources from ABL's DT; decide */
++static void abl_bm_read(const void *fdt, int (*mem_ok)(unsigned long, unsigned long),
++			struct abl_boot_mode *bm)
++{
++	const char *bootargs = NULL, *mode;
++	int node = -1, len = 0, valid = fdt && !fdt_check_header(fdt);
++
++	bm->oplus[0] = '\0';
++	bm->bootconfig[0] = '\0';
++	bm->cmdline[0] = '\0';
++	bm->bootconfig_state = fdt ? "ABL's DT is not valid" : "no DT from ABL";
++	if (valid)
++		node = fdt_path_offset(fdt, "/chosen");
++	if (node >= 0) {
++		bootargs = fdt_getprop(fdt, node, "bootargs", &len);
++		if (bootargs) {
++			if (len > 0 && bootargs[len - 1] == '\0')
++				len--;
++			abl_bm_cmdline(bootargs, len, "oplusboot.mode=", bm->oplus);
++			abl_bm_cmdline(bootargs, len, "androidboot.mode=", bm->cmdline);
++		}
++		unsigned long rs = abl_bm_addr_prop(fdt, node, "linux,initrd-start");
++		unsigned long re = abl_bm_addr_prop(fdt, node, "linux,initrd-end");
++
++		bm->bootconfig_state = abl_bm_bootconfig(rs, re, mem_ok, bm->bootconfig);
++	} else if (valid) {
++		bm->bootconfig_state = "no /chosen in ABL's DT";
++	}
++
++	/* any source saying "charger" wins; else the first one that says anything */
++	if (!strcmp(bm->oplus, "charger") || !strcmp(bm->bootconfig, "charger") ||
++	    !strcmp(bm->cmdline, "charger"))
++		mode = "charger";
++	else if (bm->oplus[0])
++		mode = bm->oplus;
++	else if (bm->bootconfig[0])
++		mode = bm->bootconfig;
++	else if (bm->cmdline[0])
++		mode = bm->cmdline;
++	else
++		mode = "unknown";
++	strcpy(bm->mode, mode);	/* every candidate is shorter than ABL_BM_LEN */
++
++	snprintf(bm->source, sizeof(bm->source),
++		 "oplusboot.mode=%s bootconfig:androidboot.mode=%s bootargs:androidboot.mode=%s%s%s",
++		 bm->oplus[0] ? bm->oplus : "-", bm->bootconfig[0] ? bm->bootconfig : "-",
++		 bm->cmdline[0] ? bm->cmdline : "-",
++		 bm->bootconfig_state ? " bootconfig:" : "",
++		 bm->bootconfig_state ? bm->bootconfig_state : "");
++	bm->done = 1;
++}
++
++#ifndef ABL_BM_HOSTTEST
++/* inside one of U-Boot's DRAM banks (all of them are mapped as normal memory) */
++static int abl_bm_mem_ok(unsigned long start, unsigned long size)
++{
++	int i;
++
++	for (i = 0; i < CONFIG_NR_DRAM_BANKS && gd->dram[i].size; i++) {
++		if (start >= gd->dram[i].start && size <= gd->dram[i].size &&
++		    start - gd->dram[i].start <= gd->dram[i].size - size)
++			return 1;
++	}
++	return 0;
++}
++
++void qcom_abl_boot_mode_init(void)
++{
++	const void *prevbl = (const void *)(uintptr_t)get_prev_bl_fdt_addr();
++
++	if (abl_bm.done)
++		return;
++	if (prevbl == gd->fdt_blob ||
++	    !abl_bm_mem_ok((unsigned long)prevbl, sizeof(struct fdt_header)))
++		prevbl = NULL;
++	abl_bm_read(prevbl, abl_bm_mem_ok, &abl_bm);
++	printf("ABL boot mode: %s (%s)\n", abl_bm.mode, abl_bm.source);
++	env_set("abl_boot_mode", abl_bm.mode);
++}
++
++/* from ft_board_setup(): the OS's DT. Never fails. */
++void qcom_abl_boot_mode_fixup(void *blob)
++{
++	int node, ret;
++
++	if (!abl_bm.done)
++		qcom_abl_boot_mode_init();
++	node = fdt_find_or_add_subnode(blob, 0, "chosen");
++	if (node < 0) {
++		log_warning("ABL boot mode: no /chosen in the OS DT: %s\n", fdt_strerror(node));
++		return;
++	}
++	ret = fdt_setprop_string(blob, node, "u-boot,abl-boot-mode", abl_bm.mode);
++	if (!ret)
++		ret = fdt_setprop_string(blob, node, "u-boot,abl-boot-mode-source", abl_bm.source);
++	if (ret)
++		log_warning("ABL boot mode: not passed to the OS: %s\n", fdt_strerror(ret));
++}
++#endif
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 35735f15..7b07397e 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -33,6 +33,7 @@
+ #include <sort.h>
+ #include <time.h>
+ 
++#include "abl-boot-mode.h"
+ #include "qcom-priv.h"
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+@@ -526,6 +527,9 @@ int board_late_init(void)
+ 	phys_addr_t addr;
+ 	struct fdt_header *fdt_blob = (struct fdt_header *)gd->fdt_blob;
+ 
++	/* ABL's boot mode, before anything is loaded into RAM (its ramdisk holds the bootconfig) */
++	qcom_abl_boot_mode_init();
++
+ 	/* We need to be fairly conservative here as we support boards with just 1G of TOTAL RAM */
+ 	status |= !lmb_alloc(SZ_128M, &addr) ?
+ 		env_set_hex("loadaddr", addr) : 1;
+diff --git a/arch/arm/mach-snapdragon/of_fixup.c b/arch/arm/mach-snapdragon/of_fixup.c
+index a4935cb4..361456b9 100644
+--- a/arch/arm/mach-snapdragon/of_fixup.c
++++ b/arch/arm/mach-snapdragon/of_fixup.c
+@@ -34,6 +34,8 @@
+ #include <tee/optee.h>
+ #include <time.h>
+ 
++#include "abl-boot-mode.h"
++
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+ /**
+@@ -318,6 +320,9 @@ int ft_board_setup(void *blob, struct bd_info *bd)
+ 	u64 start[CONFIG_NR_DRAM_BANKS], size[CONFIG_NR_DRAM_BANKS];
+ 	int banks = prevbl_memory(start, size);
+ 
++	/* never fails: the boot goes on without it */
++	qcom_abl_boot_mode_fixup(blob);
++
+ 	return banks ? fdt_fixup_memory_banks(blob, start, size, banks) : 0;
+ }
+ 
+diff --git a/configs/iceland_defconfig b/configs/iceland_defconfig
+index c3060885..26996129 100644
+--- a/configs/iceland_defconfig
++++ b/configs/iceland_defconfig
+@@ -9,6 +9,7 @@ CONFIG_LNX_KRNL_IMG_TEXT_OFFSET_BASE=0x0
+ CONFIG_PHY_QCOM_M31_EUSB2=y
+ CONFIG_PHY_QCOM_EUSB2_REPEATER=y
+ CONFIG_QCOM_SPMI_SDAM=y
++CONFIG_QCOM_ABL_BOOT_MODE=y
+ # CONFIG_QCOM_RPMH_POWER_DOMAIN is not set
+ CONFIG_USB_FUNCTION_FASTBOOT=y
+ # 1 GiB download buffer in the 9 GiB RAM bank (a rehearsal head is a few hundred MB of gzip)
+-- 
+2.43.0
+
