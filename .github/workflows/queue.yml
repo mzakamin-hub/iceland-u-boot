@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# On every push and pull request that touches the queue: scripts/prepare.sh applies the patch queue onto the pinned
+# U-Boot tag in a temporary clone and checks every series' tree hash against uboot.pin.
+name: queue
+
+on:
+  push:
+    paths:
+      - 'patches/**'
+      - 'uboot.pin'
+      - 'scripts/**'
+      - '.github/**'
+  pull_request:
+    paths:
+      - 'patches/**'
+      - 'uboot.pin'
+      - 'scripts/**'
+      - '.github/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: queue-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  queue:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the queue onto the pinned U-Boot tag (tree hashes verified)
+        run: scripts/prepare.sh "$RUNNER_TEMP/src"

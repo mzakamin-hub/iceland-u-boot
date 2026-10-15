@@ -1,0 +1,11 @@
+# privacy-scan allow-list (read by .github/scripts/privacy-scan.py).
+#   value <string>        a known-safe value, allowed in every file (exact match, case-insensitive)
+#   skip <rule|*> <glob>  do not apply a rule to matching paths (rules: mac ipv4 email key nm name blob)
+# Only generic, documented values belong here. Never add a value that belongs to one device or one person's
+# network (serial numbers, MAC / Bluetooth addresses, network names): fix the file instead.
+#
+# Licence and notice texts carry their authors' published addresses.
+skip email *Notice-*.txt
+skip email *NOTICE*
+skip email *LICENSE*
+skip email *COPYING*
