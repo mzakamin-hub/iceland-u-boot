@@ -3,9 +3,9 @@
 U-Boot for the OnePlus Pad 4 (`iceland`, SM8850P), chainloaded by the stock OnePlus ABL: the same boot path as the
 OnePlus 15 (infiniti-mainline). Kept as a patch queue on an upstream tag; every commit keeps its author.
 
-Current state (15 Oct 2026): the U-Boot install build **v4** (0001-0012) is in `boot_b` on the tablet since 14 Oct
-2026, and Fedora 44 boots from it on its own, with the system on `userdata`. v4 adds a power-on boot menu on the keys
-to the install build v3 of 13 Oct 2026. See [Install record](#install-record).
+Current state (15 Oct 2026): the U-Boot install build **v4** (0001-0012) is the boot path of the Fedora 44 install: it
+sits in `boot_b` and starts Fedora from the disk image in `userdata`. v4 adds a power-on boot menu on the keys to the
+install build v3. See [Installing](#installing).
 
 | Path | Content |
 |---|---|
@@ -24,8 +24,8 @@ Licence: GPL-2.0+ (U-Boot `Licenses/`). The boot image header values must match 
 ## Boot flow (as installed)
 
 1. ABL (stock, closed) starts the `boot_b` image, checks its AVB footer and counts the tries of slot b.
-2. `boot_b` holds the install build v4, footered for that day's `boot_b` (footered image sha256 prefix `b714356a`;
-   the unfootered build is `23ff0be6`). It shows a boot menu for 5 s (Fedora by default, or the boot loader's
+2. `boot_b` holds the install build v4 with an AVB footer made for the tablet's own `boot_b` (so the footered image's
+   hash differs from tablet to tablet; the unfootered build is `23ff0be6`). It shows a boot menu for 5 s (Fedora by default, or the boot loader's
    fastboot; Volume Down moves, Power selects). U-Boot looks for a `fedora` partition (there is none), then runs
    `bootefi bootmgr` on the disk image in `userdata`. If that finds nothing, it falls back to fastboot.
 3. The disk image in `userdata` is Fedora's: its EFI programs are shim and GRUB (aarch64). GRUB loads
@@ -36,8 +36,9 @@ Licence: GPL-2.0+ (U-Boot `Licenses/`). The boot image header values must match 
 
 Slot marking. ABL keeps three values per slot: a successful flag, an unbootable flag and a retry count. Each normal
 power-on of a slot that is not marked successful uses one try, and flashing `boot_b` resets slot b. U-Boot does not
-mark slots; Fedora's `qbootctl -m` marks a slot successful. Slot b is marked successful on the installed system (after
-the v3 write on 13 Oct and again after the v4 write on 14 Oct 2026).
+mark slots; on the installed system `iceland-slot-mark` (iceland-device 0.28-8 and newer) runs Fedora's `qbootctl -m`
+once after a good boot. For the same reason the install build never resets by itself: a reset is another boot of the
+slot.
 
 ## Install build: patches 0004-0012
 
@@ -58,8 +59,7 @@ of it and checks `TREE_AFTER_0002_iceland` in `uboot.pin` (recorded for the inst
 | 0011 board: iceland: ABL's boot mode | reads ABL's boot mode read-only (bootconfig `androidboot.mode`, bootargs `oplusboot.mode`), prints it (`ABL boot mode: normal`) and adds it to the device tree U-Boot hands on; no storage access, never fails the boot |
 | 0012 board: iceland: power-on boot menu | a boot menu on the keys in the install environment: it waits until no key is held, shows 5 s with Fedora as the default and an entry for the boot loader's fastboot (the reboot reason is stored in the PMIC and read back before the reset); Volume Down + Power at power-on still reaches ABL's fastboot |
 
-Tablet proof of v3 (10 Oct 2026). The RAM boots wrote nothing. Every `boot_b` test write was undone the same day with the
-original `boot_b` image, and LineageOS came back on slot b each time.
+Tested on the tablet (RAM boots write nothing; every test write of `boot_b` was undone with the saved original):
 
 - RAM boot of 0009: fastboot after 2 s, `userdata` mapped, the boot manager fails cleanly, no reset, slot flags
   unchanged.
@@ -67,18 +67,15 @@ original `boot_b` image, and LineageOS came back on slot b each time.
   "Reset Timed Out".
 - RAM boot of v3 (0010): `fastboot reboot-bootloader` gives ABL's fastboot after 15 s, slot flags unchanged.
 - `boot_b` with v3 (0008-0010): fastboot after 7 s; `fastboot reboot-bootloader` gives ABL's fastboot after 14 s with
-  no key press. The retry count of slot b went down only by the one U-Boot boot.
-
-Tablet proof of v4 (14 Oct 2026): a RAM boot of the v4 install build showed the menu (Fedora, Boot loader) and booted
-Fedora after the timeout; Volume Down moved the highlight and Power on "Boot loader (fastboot)" landed in ABL's fastboot
-with the slot flags unchanged. After the `boot_b` write the menu appears at power-on and Fedora boots.
+  no key press. One normal boot into U-Boot used one try of slot b; `reboot-bootloader` used none.
+- v4: the menu (Fedora, Boot loader) appears at power-on and Fedora boots after the timeout; Volume Down moves the
+  highlight, and Power on "Boot loader (fastboot)" lands in ABL's fastboot with the slot flags unchanged.
 
 Build images of v4 (sha256; the images are not published):
 
 | Image | sha256 |
 |---|---|
 | install `u-boot-iceland-usb.img` | `23ff0be6b688560de8a63c5c49cf99b10a0a023fd36f4d9542edcf2660ef2c84` |
-| install, footered for `boot_b` (100,663,296 bytes) | `b714356adf54d4e4db77447716f6d07d834f56af90e75f537e0080be860c9af6` |
 | rehearsal `u-boot-iceland-rehearsal-usb.img` (no SCSI or UFS) | `a9fe780aafe3e6d190120b1ddf5fb9a698fcbec9825f94e16786bb3df62e8804` |
 
 Build images of v3 (sha256; the images are not published, see below):
@@ -89,17 +86,16 @@ Build images of v3 (sha256; the images are not published, see below):
 | rehearsal `u-boot-iceland-rehearsal-usb.img` (no SCSI or UFS) | `8a1b011cea5d16a82ca96eb3964b222300f8509f6bbd7962f073f6d938c3c096` |
 | usbcold `u-boot-iceland-usbcold.img` (diagnostic, RAM boot only) | `778e979cbdbb51293b5b6a316e79acd1c7e564563a7eb4fe3f9c7a32a53e6dc8` |
 
-The install image written to `boot_b` is footered with that day's `boot_b` (AVB footer proof passed on the PC), so its
-hash differs: the footer sha256 prefix is `4955ee98`. A rebuild with `scripts/build.sh` gives the same source tree but
+The image written to `boot_b` carries an AVB footer made for the tablet's current `boot_b`, so its hash differs from the
+plain build's. A rebuild with `scripts/build.sh` gives the same source tree but
 not the same image hash, because U-Boot embeds its build time.
 
 Boot header values (`uboot.pin`, `tools/install/BUILD_INFO-v3.txt`): header v4, `os_version` 17.0.0, patch level
-2026-09, mkbootimg `808ecd09`. A `boot_b` image must carry the boot header values of that day's `boot_b` (anti-rollback).
+2026-09, mkbootimg `808ecd09`. A `boot_b` image must carry the boot header values of the tablet's current `boot_b` (anti-rollback).
 
-## Install record
+## Installing
 
-- The owner wrote two images after the PC-side checks. Write 1 put the Fedora 44 install image (hash prefix
-  `2246e9a7`) into `userdata` (267 s, OKAY). Write 2, at 20:47, put the footered v3 build into `boot_b` (2.3 s, OKAY).
-- Fedora booted from `boot_b` on its own at 20:48. First-boot setup followed.
-- 14 Oct 2026: the owner wrote the footered v4 build (`b714356a`) into `boot_b` (2.4 s, OKAY). The menu appeared at
-  the first power-on and Fedora booted; slot b was marked successful again.
+The install writes two partitions: the Fedora disk image into `userdata`, and this install build, with an AVB footer
+made for the tablet's current `boot_b`, into `boot_b`. The requirements, the steps and the way back are in
+[iceland-mainline/docs/INSTALL-GUIDE.md](https://github.com/mzakamin-hub/iceland-mainline/blob/main/docs/INSTALL-GUIDE.md).
+A later U-Boot update is the same `boot_b` write with a newly footered build.
