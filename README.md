@@ -42,8 +42,8 @@ the v3 write on 13 Oct and again after the v4 write on 14 Oct 2026).
 ## Install build: patches 0004-0012
 
 `patches/0002-iceland/` carries the install build on top of the board (0001-0003). `scripts/prepare.sh` applies all
-of it and checks `TREE_AFTER_0002_iceland` in `uboot.pin` (recorded for the install build v3, 0001-0010: U-Boot commit
-`aac9e744ec6f`, tree `158b0f7851ad`). `scripts/build.sh` then makes the install build (`iceland_defconfig`,
+of it and checks `TREE_AFTER_0002_iceland` in `uboot.pin` (recorded for the install build v4, 0001-0012: U-Boot commit
+`e0300255e054`, tree `35655ad58d6a`; v3, 0001-0010, was tree `158b0f7851ad`). `scripts/build.sh` then makes the install build (`iceland_defconfig`,
 `iceland.env`).
 
 | Patch | What it does |
