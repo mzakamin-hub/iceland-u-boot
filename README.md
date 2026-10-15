@@ -21,6 +21,20 @@ scripts/prepare.sh ./src && scripts/build.sh ./src ./out
 
 Licence: GPL-2.0+ (U-Boot `Licenses/`). The boot image header values must match stock (`uboot.pin`).
 
+## Download
+
+Release [`v4-2026-10-15`](https://github.com/mzakamin-hub/iceland-u-boot/releases/tag/v4-2026-10-15) (source `382c39f`):
+
+| File | SHA-256 |
+|---|---|
+| `u-boot-iceland-v4.img` (plain, for `fastboot boot` RAM tests) | `23ff0be6b688560de8a63c5c49cf99b10a0a023fd36f4d9542edcf2660ef2c84` |
+| `u-boot-iceland-v4-footered.img` (AVB-footered for `boot_b`) | `b714356adf54d4e4db77447716f6d07d834f56af90e75f537e0080be860c9af6` |
+
+The footered image is signed with the public AOSP test key and carries the footer values of the reference
+LineageOS (test-keys) `boot_b` (rollback index `1788220800`, os_version 17, security_patch 2026-09-01); it fits
+only a tablet whose `boot_b` footer has the same values. Otherwise make the footer locally from the plain image:
+[iceland-mainline/tools/installer/README-INSTALLER.md](https://github.com/mzakamin-hub/iceland-mainline/blob/main/tools/installer/README-INSTALLER.md).
+
 ## Boot flow (as installed)
 
 1. ABL (stock, closed) starts the `boot_b` image, checks its AVB footer and counts the tries of slot b.
