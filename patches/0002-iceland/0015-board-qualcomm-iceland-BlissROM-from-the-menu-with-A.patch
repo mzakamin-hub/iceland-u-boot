@@ -1,0 +1,442 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Sat, 17 Oct 2026 17:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: BlissROM from the menu with ABL's
+ ramdisk
+
+The menu's BlissROM entry stored the reboot reason "recovery" so that
+ABL would start the Android kernel in recovery_b. The Pad 4's ABL does
+not do that: it starts recovery_b only when the image there has no
+kernel, and then with boot_b's kernel, which is U-Boot. An image with a
+kernel in recovery_b makes ABL stop in its fastboot.
+
+ABL does not need to start Android itself, though. U-Boot sits in
+boot_b as an Android boot image (header v4, no ramdisk), so on every
+start ABL already prepares the rest of an Android boot for it: the
+slot's vendor_boot + init_boot ramdisks with its bootconfig block, the
+DT from vendor_boot + dtbo with the Android /chosen bootargs, and the
+verified-boot state. U-Boot keeps the address of that DT (x0).
+
+- mach-snapdragon: qcom_android_chain <interface> <partition>: load the
+  kernel of the Android boot image in <partition> (v3 / v4, an arm64
+  Image of at most 128 MiB) to ${kernel_addr_r} and booti it with
+  ABL's ramdisk (left in place) and ABL's DT, its bootargs unchanged.
+  It refuses, with nothing loaded, unless ABL's DT is valid, in RAM and
+  has Android bootargs, the ramdisk range is in RAM with a cpio or
+  compressed start and a bootconfig trailer, the partition is unique
+  and the kernel area overlaps neither. Reads storage only.
+- qcom_recovery_gate [interface [partition]]: the partition can be
+  named (default recovery_b, as before). The AVB footer rule stays for
+  recovery_b only: ABL never starts another partition.
+- env: the entry is "BlissROM=qcom_android_chain scsi boot_a", offered
+  when "qcom_recovery_gate scsi boot_a" is open (fedora next to
+  userdata, userdata not the Fedora disk, an arm64 kernel in boot_a,
+  the unused slot-a boot partition). If the chain refuses, the menu
+  returns and the boot goes on to Fedora; no reset.
+
+Android sees a normal start of slot b: ABL's mode, slot suffix, root of
+trust and bootconfig, only the kernel comes from boot_a.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ arch/arm/mach-snapdragon/Kconfig         |   4 +
+ arch/arm/mach-snapdragon/Makefile        |   2 +-
+ arch/arm/mach-snapdragon/android_chain.c | 250 +++++++++++++++++++++++
+ arch/arm/mach-snapdragon/boot_menu.c     |  35 ++--
+ board/qualcomm/iceland.env               |   4 +-
+ 5 files changed, 276 insertions(+), 19 deletions(-)
+ create mode 100644 arch/arm/mach-snapdragon/android_chain.c
+
+diff --git a/arch/arm/mach-snapdragon/Kconfig b/arch/arm/mach-snapdragon/Kconfig
+index 49c1d819..6bfe32c1 100644
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -64,5 +64,9 @@ config QCOM_BOOT_MENU
+ 	  an Android boot image with an arm64 kernel. qcom_reboot_mode
+ 	  stores ABL's reboot reason (recovery or bootloader) in the DT's
+ 	  nvmem-reboot-mode cell, reads it back and resets.
++	  qcom_android_chain boots the Android kernel of a partition (an
++	  Android boot image) with the ramdisk and DT that ABL prepared for
++	  the boot image it started (U-Boot); qcom_recovery_gate can check
++	  that partition instead of recovery_b.
+ 
+ endif
+diff --git a/arch/arm/mach-snapdragon/Makefile b/arch/arm/mach-snapdragon/Makefile
+index 730c46df..abef7f23 100644
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -5,6 +5,6 @@
+ obj-y += board.o
+ obj-$(CONFIG_FASTBOOT) += fastboot.o
+ obj-$(CONFIG_QCOM_ABL_BOOT_MODE) += abl_boot_mode.o
+-obj-$(CONFIG_QCOM_BOOT_MENU) += boot_menu.o reboot_mode_cmd.o
++obj-$(CONFIG_QCOM_BOOT_MENU) += boot_menu.o reboot_mode_cmd.o android_chain.o
+ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ obj-$(CONFIG_OF_LIVE) += of_fixup.o
+diff --git a/arch/arm/mach-snapdragon/android_chain.c b/arch/arm/mach-snapdragon/android_chain.c
+new file mode 100644
+index 00000000..1843a441
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/android_chain.c
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * qcom_android_chain <interface> <partition>
++ *
++ * Boot the Android system whose kernel sits in <partition> (an Android boot
++ * image, header v3 / v4, arm64 Image) with everything else ABL prepared for
++ * the boot image it started, U-Boot in boot_<slot>: ABL treats that image as
++ * an Android boot image, so before it jumps to U-Boot it has already loaded
++ * the slot's vendor_boot + init_boot ramdisks with its bootconfig block, built
++ * the device tree from vendor_boot + dtbo with its /chosen bootargs, and
++ * computed the verified-boot state and root of trust. U-Boot keeps the
++ * address of that DT (x0, get_prev_bl_fdt_addr()); its /chosen
++ * linux,initrd-start / -end bound the ramdisk. Only the kernel is swapped.
++ *
++ * Refuses (and returns, nothing loaded or changed) unless: ABL's DT is valid,
++ * in RAM and not U-Boot's own; it has /chosen bootargs and a ramdisk range in
++ * RAM whose start holds a cpio / gzip / lz4 / zstd magic and whose end holds
++ * a bootconfig block with androidboot.* values (header v4: ABL passes them
++ * there, not in the bootargs); exactly one device of <interface> has <partition>;
++ * its header is v3 / v4 with an arm64 Image of at most 128 MiB; and the
++ * kernel's load area ${kernel_addr_r} lies in RAM and does not overlap the DT
++ * or the ramdisk. Reads the partition only, writes no storage.
++ *
++ * The boot itself is booti with the ramdisk in place (initrd_high = ~0) and
++ * U-Boot's usual DT fixups (memory banks from ABL's DT, /chosen initrd range,
++ * the abl-boot-mode note); bootargs are left as ABL wrote them.
++ */
++
++#include <blk.h>
++#include <command.h>
++#include <dm.h>
++#include <env.h>
++#include <fdt_support.h>
++#include <malloc.h>
++#include <memalign.h>
++#include <part.h>
++#include <stdio.h>
++#include <vsprintf.h>
++#include <init.h>
++#include <asm/global_data.h>
++#include <asm/unaligned.h>
++#include <dm/device-internal.h>
++#include <linux/kernel.h>
++#include <linux/libfdt.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++#define CHAIN_PAGE		4096
++#define CHAIN_ARM64_MAGIC	0x644d5241	/* "ARM\x64" at offset 0x38 of an arm64 Image */
++#define CHAIN_KERNEL_MAX	SZ_128M		/* the size of the ${kernel_addr_r} area (board.c) */
++#define CHAIN_MAX_DEVS		16
++#define CHAIN_BC_MAGIC		"#BOOTCONFIG\n"
++
++/* [start, start + size) inside one of U-Boot's DRAM banks */
++static int chain_in_ram(ulong start, ulong size)
++{
++	int i;
++
++	for (i = 0; i < CONFIG_NR_DRAM_BANKS && gd->dram[i].size; i++)
++		if (start >= gd->dram[i].start && size <= gd->dram[i].size &&
++		    start - gd->dram[i].start <= gd->dram[i].size - size)
++			return 1;
++	return 0;
++}
++
++static int chain_overlap(ulong a, ulong alen, ulong b, ulong blen)
++{
++	return a < b + blen && b < a + alen;
++}
++
++static ulong chain_addr_prop(const void *fdt, int node, const char *name)
++{
++	const fdt32_t *p;
++	int len;
++
++	p = fdt_getprop(fdt, node, name, &len);
++	if (!p)
++		return 0;
++	if (len == 8)
++		return (ulong)((u64)fdt32_to_cpu(p[0]) << 32 | fdt32_to_cpu(p[1]));
++	if (len == 4)
++		return fdt32_to_cpu(p[0]);
++	return 0;
++}
++
++/* exactly one device of @iface has a partition @name */
++static int chain_find_part(const char *iface, const char *name, struct blk_desc **descp,
++			   struct disk_partition *info)
++{
++	struct disk_partition p;
++	struct blk_desc *desc;
++	int i, found = 0;
++
++	for (i = 0; i < CHAIN_MAX_DEVS; i++) {
++		desc = blk_get_devnum_by_uclass_idname(iface, i);
++		if (!desc || desc->type == DEV_TYPE_UNKNOWN || !desc->blksz ||
++		    device_probe(desc->bdev))
++			continue;
++		if (part_get_info_by_name(desc, name, &p) < 0)
++			continue;
++		if (found++)
++			return -EEXIST;
++		*descp = desc;
++		*info = p;
++	}
++	return found ? 0 : -ENOENT;
++}
++
++/* @needle in the @len bytes at @hay */
++static int chain_contains(const char *hay, ulong len, const char *needle)
++{
++	ulong i, n = strlen(needle);
++
++	for (i = 0; i + n <= len; i++)
++		if (!memcmp(hay + i, needle, n))
++			return 1;
++	return 0;
++}
++
++/* a ramdisk starts with a newc cpio or a compressed stream */
++static int chain_ramdisk_magic(const u8 *p)
++{
++	return !memcmp(p, "070701", 6) || !memcmp(p, "070702", 6) ||
++	       (p[0] == 0x1f && p[1] == 0x8b) ||				/* gzip */
++	       get_unaligned_le32(p) == 0x184c2102 ||			/* lz4 legacy */
++	       get_unaligned_le32(p) == 0x184d2204 ||			/* lz4 frame */
++	       get_unaligned_le32(p) == 0xfd2fb528;			/* zstd */
++}
++
++static int do_qcom_android_chain(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	const void *fdt = (const void *)(uintptr_t)get_prev_bl_fdt_addr();
++	struct disk_partition pi;
++	struct blk_desc *desc;
++	ulong rs, re, kaddr, fsize, ksize, kblk, n;
++	const char *bootargs;
++	char cmd[96];
++	u8 *hdr;
++	int node, len, ret;
++	u32 ver;
++
++	if (argc != 3)
++		return CMD_RET_USAGE;
++
++	/* ---- ABL's payload ---- */
++	if (!fdt || fdt == gd->fdt_blob || !chain_in_ram((ulong)fdt, sizeof(struct fdt_header)) ||
++	    fdt_check_header(fdt)) {
++		printf("=== android chain: no valid DT from ABL: not started ===\n");
++		return CMD_RET_FAILURE;
++	}
++	fsize = fdt_totalsize(fdt);
++	if (!chain_in_ram((ulong)fdt, fsize)) {
++		printf("=== android chain: ABL's DT is not in RAM: not started ===\n");
++		return CMD_RET_FAILURE;
++	}
++	node = fdt_path_offset(fdt, "/chosen");
++	bootargs = node >= 0 ? fdt_getprop(fdt, node, "bootargs", &len) : NULL;
++	if (!bootargs || len < 2) {
++		printf("=== android chain: ABL's DT has no bootargs: not started ===\n");
++		return CMD_RET_FAILURE;
++	}
++	rs = chain_addr_prop(fdt, node, "linux,initrd-start");
++	re = chain_addr_prop(fdt, node, "linux,initrd-end");
++	if (!rs || re <= rs + 64 || !chain_in_ram(rs, re - rs)) {
++		printf("=== android chain: no ramdisk from ABL (%#lx-%#lx): not started ===\n", rs, re);
++		return CMD_RET_FAILURE;
++	}
++	if (!chain_ramdisk_magic((const u8 *)rs)) {
++		printf("=== android chain: ABL's ramdisk at %#lx does not start with a cpio / compressed stream: not started ===\n", rs);
++		return CMD_RET_FAILURE;
++	}
++	for (n = 0; n < 4; n++)
++		if (!memcmp((const void *)(re - n - strlen(CHAIN_BC_MAGIC)), CHAIN_BC_MAGIC,
++			    strlen(CHAIN_BC_MAGIC)))
++			break;
++	if (n == 4) {
++		printf("=== android chain: ABL's ramdisk has no bootconfig trailer: not started ===\n");
++		return CMD_RET_FAILURE;
++	}
++	{
++		const u8 *mg = (const u8 *)(re - n - strlen(CHAIN_BC_MAGIC));
++		ulong bsz = get_unaligned_le32(mg - 8);
++
++		if (!bsz || bsz > SZ_64K || (ulong)(mg - 8) - rs < bsz ||
++		    !chain_contains((const char *)(mg - 8 - bsz), bsz, "androidboot.")) {
++			printf("=== android chain: ABL's bootconfig has no androidboot values: not started ===\n");
++			return CMD_RET_FAILURE;
++		}
++	}
++
++	/* ---- the kernel ---- */
++	ret = chain_find_part(argv[1], argv[2], &desc, &pi);
++	if (ret) {
++		printf("=== android chain: %s %s partition: not started ===\n",
++		       ret == -EEXIST ? "more than one" : "no", argv[2]);
++		return CMD_RET_FAILURE;
++	}
++	n = DIV_ROUND_UP(CHAIN_PAGE, desc->blksz);
++	hdr = memalign(ARCH_DMA_MINALIGN, n * desc->blksz);
++	if (!hdr)
++		return CMD_RET_FAILURE;
++	if (blk_dread(desc, pi.start, n, hdr) != n) {
++		free(hdr);
++		printf("=== android chain: %s cannot be read: not started ===\n", argv[2]);
++		return CMD_RET_FAILURE;
++	}
++	ver = get_unaligned_le32(hdr + 40);
++	ksize = get_unaligned_le32(hdr + 8);
++	ret = memcmp(hdr, "ANDROID!", 8) || (ver != 3 && ver != 4);
++	free(hdr);
++	if (ret || ksize < 0x40 || ksize > CHAIN_KERNEL_MAX ||
++	    (u64)CHAIN_PAGE + ksize > (u64)pi.size * desc->blksz) {
++		printf("=== android chain: %s holds no boot image v3 / v4 with a kernel of 64 B - 128 MiB: not started ===\n",
++		       argv[2]);
++		return CMD_RET_FAILURE;
++	}
++	kaddr = env_get_hex("kernel_addr_r", 0);
++	kblk = DIV_ROUND_UP(ksize, desc->blksz);
++	if (!kaddr || !chain_in_ram(kaddr, kblk * desc->blksz) ||
++	    chain_overlap(kaddr, kblk * desc->blksz, (ulong)fdt, fsize) ||
++	    chain_overlap(kaddr, kblk * desc->blksz, rs, re - rs)) {
++		printf("=== android chain: the kernel area %#lx (+%#lx) overlaps ABL's DT / ramdisk or is not in RAM: not started ===\n",
++		       kaddr, kblk * desc->blksz);
++		return CMD_RET_FAILURE;
++	}
++	if (blk_dread(desc, pi.start + n, kblk, (void *)kaddr) != kblk) {
++		printf("=== android chain: the kernel of %s cannot be read: not started ===\n", argv[2]);
++		return CMD_RET_FAILURE;
++	}
++	if (get_unaligned_le32((const u8 *)kaddr + 0x38) != CHAIN_ARM64_MAGIC) {
++		printf("=== android chain: the kernel of %s is not an arm64 Image: not started ===\n", argv[2]);
++		return CMD_RET_FAILURE;
++	}
++
++	printf("=== android chain: kernel %s (%lu B) at %#lx, ABL's ramdisk %#lx-%#lx, ABL's DT %#lx (%lu B) ===\n",
++	       argv[2], ksize, kaddr, rs, re, (ulong)fdt, fsize);
++	env_set("bootargs", NULL);		/* /chosen bootargs stay as ABL wrote them */
++	env_set("initrd_high", "0xffffffffffffffff");	/* the ramdisk stays where ABL put it */
++	snprintf(cmd, sizeof(cmd), "booti %#lx %#lx:%#lx %#lx", kaddr, rs, re - rs, (ulong)fdt);
++	run_command(cmd, 0);
++
++	printf("=== android chain: booti returned: not started ===\n");
++	return CMD_RET_FAILURE;
++}
++
++U_BOOT_CMD(qcom_android_chain, 3, 0, do_qcom_android_chain,
++	   "boot the Android kernel of a partition with ABL's ramdisk and DT",
++	   "<interface> <partition>  - e.g. scsi boot_a");
+diff --git a/arch/arm/mach-snapdragon/boot_menu.c b/arch/arm/mach-snapdragon/boot_menu.c
+index 9b8f5d94..2ba901b1 100644
+--- a/arch/arm/mach-snapdragon/boot_menu.c
++++ b/arch/arm/mach-snapdragon/boot_menu.c
+@@ -11,7 +11,10 @@
+  *	device on would otherwise select a menu entry. Fails (and drops the
+  *	queue as well) if a button is still held after <seconds>.
+  *
+- * qcom_recovery_gate [interface]
++ * qcom_recovery_gate [interface [partition]]
++ *	(0015: <partition> defaults to recovery_b; the AVB footer rule below is
++ *	for recovery_b only - ABL never starts another partition, U-Boot's
++ *	qcom_android_chain loads its kernel itself.)
+  *	Succeeds only when the recovery_b partition can start another OS:
+  *	exactly one block device of <interface> (default scsi) has a
+  *	"userdata" partition, the same device also has a "fedora" partition
+@@ -280,6 +283,7 @@ static int do_qcom_recovery_gate(struct cmd_tbl *cmdtp, int flag, int argc,
+ 				 char *const argv[])
+ {
+ 	const char *iface = argc > 1 ? argv[1] : "scsi";
++	const char *pn = argc > 2 ? argv[2] : "recovery_b";
+ 	struct disk_partition ud, fd, rb;
+ 	struct blk_desc *udesc, *fdesc, *rdesc;
+ 	const char *why = NULL;
+@@ -287,7 +291,7 @@ static int do_qcom_recovery_gate(struct cmd_tbl *cmdtp, int flag, int argc,
+ 	u8 *buf;
+ 	int ret;
+ 
+-	if (argc > 2)
++	if (argc > 3 || strlen(pn) > 32)
+ 		return CMD_RET_USAGE;
+ 
+ 	ret = qcom_find_part(iface, "userdata", &udesc, &ud);
+@@ -326,34 +330,33 @@ static int do_qcom_recovery_gate(struct cmd_tbl *cmdtp, int flag, int argc,
+ 		return CMD_RET_FAILURE;
+ 	}
+ 
+-	ret = qcom_find_part(iface, "recovery_b", &rdesc, &rb);
++	ret = qcom_find_part(iface, pn, &rdesc, &rb);
+ 	if (ret) {
+-		printf("=== recovery gate: %s recovery_b partition: closed ===\n",
+-		       ret == -EEXIST ? "more than one" : "no");
++		printf("=== recovery gate: %s %s partition: closed ===\n",
++		       ret == -EEXIST ? "more than one" : "no", pn);
+ 		return CMD_RET_FAILURE;
+ 	}
+ 
+ 	nblk = DIV_ROUND_UP(2 * QCOM_BOOT_PAGE, rdesc->blksz);
+ 	if (rb.size < nblk) {
+-		printf("=== recovery gate: recovery_b is too small: closed ===\n");
++		printf("=== recovery gate: %s is too small: closed ===\n", pn);
+ 		return CMD_RET_FAILURE;
+ 	}
+ 	buf = memalign(ARCH_DMA_MINALIGN, nblk * rdesc->blksz);
+ 	if (!buf)
+ 		return CMD_RET_FAILURE;
+ 	if (blk_dread(rdesc, rb.start, nblk, buf) != nblk)
+-		why = "recovery_b cannot be read";
++		why = "the partition cannot be read";
+ 	else
+ 		why = qcom_recovery_check(buf, (u64)rb.size * rdesc->blksz);
+-	if (!why)
++	if (!why && !strcmp(pn, "recovery_b"))
+ 		why = qcom_avb_check(rdesc, &rb, get_unaligned_le32(buf + 8));
+ 	if (!why)
+-		printf("%s (%u bytes): open ===\n",
+-		       "=== recovery gate: fedora next to userdata, recovery_b holds an Android kernel",
+-		       get_unaligned_le32(buf + 8));
++		printf("=== recovery gate: fedora next to userdata, %s holds an Android kernel (%u bytes): open ===\n",
++		       pn, get_unaligned_le32(buf + 8));
+ 	free(buf);
+ 	if (why) {
+-		printf("=== recovery gate: recovery_b: %s: closed ===\n", why);
++		printf("=== recovery gate: %s: %s: closed ===\n", pn, why);
+ 		return CMD_RET_FAILURE;
+ 	}
+ 
+@@ -364,7 +367,7 @@ U_BOOT_CMD(qcom_keys_released, 2, 0, do_qcom_keys_released,
+ 	   "wait until no key is held, then drop queued console input",
+ 	   "<seconds>  - fails if a key is still held after <seconds> (1-60)");
+ 
+-U_BOOT_CMD(qcom_recovery_gate, 2, 0, do_qcom_recovery_gate,
+-	   "check that recovery_b can start another OS (read only)",
+-	   "[interface]  - default scsi: userdata (not the Fedora disk) + fedora on one disk, an Android kernel\n"
+-	   "    with an AVB footer for recovery in recovery_b");
++U_BOOT_CMD(qcom_recovery_gate, 3, 0, do_qcom_recovery_gate,
++	   "check that a partition can start another OS (read only)",
++	   "[interface [partition]]  - default scsi recovery_b: userdata (not the Fedora disk) + fedora on one\n"
++	   "    disk, an Android kernel in the partition (recovery_b: with an AVB footer for recovery)");
+diff --git a/board/qualcomm/iceland.env b/board/qualcomm/iceland.env
+index daae9738..1896a4e5 100644
+--- a/board/qualcomm/iceland.env
++++ b/board/qualcomm/iceland.env
+@@ -44,7 +44,7 @@ fedora_bootopt=if test -n "${bdev}" && part start blkmap ${bdev} 1 esp_start; th
+ fedora_blkmap=scsi scan && part start scsi 0 fedora fd_start && part size scsi 0 fedora fd_size && blkmap create fedora && blkmap map fedora 0 ${fd_size} linear scsi 0 ${fd_start}
+ # The power-on menu (patch 0012), after the disk is mapped: Volume Up / Volume Down move, Power selects (button-kbd
+ # makes the character when a key is RELEASED). 5 s, then the default: Fedora. "Fedora", the menu's "Exit" line and
+-# ESC leave the menu and the boot goes on as before (bootmenu runs only inside bootcmd: there is no U-Boot console). "BlissROM" (the Android entry) only when qcom_recovery_gate is open (read only: the userdata
++# ESC leave the menu and the boot goes on as before (bootmenu runs only inside bootcmd: there is no U-Boot console). "BlissROM" (the Android entry, 0015) only when "qcom_recovery_gate scsi boot_a" is open (read only: the userdata
+ # LUN also has a "fedora" partition, so userdata is Android's, and recovery_b holds an Android boot image with an
+ # arm64 kernel): store the reboot reason "recovery" for ABL, read it back, reset; ABL starts recovery_b.
+ # "Boot loader (fastboot)": the same with "bootloader" (patch 0010's reboot-bootloader store). If a store fails,
+@@ -57,7 +57,7 @@ bootmenu_delay=5
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ menu_keys_timeout=10
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+-menu_setup=setenv bootmenu_0 "Fedora=true"; if qcom_recovery_gate scsi; then setenv bootmenu_1 "BlissROM=qcom_reboot_mode recovery"; setenv bootmenu_2 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; else setenv bootmenu_1 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; setenv bootmenu_2; fi; setenv bootmenu_3; setenv bootmenu_default 0
++menu_setup=setenv bootmenu_0 "Fedora=true"; if qcom_recovery_gate scsi boot_a; then setenv bootmenu_1 "BlissROM=qcom_android_chain scsi boot_a; echo === BlissROM did not start - the line above says why - Fedora in 20 s ===; sleep 20"; setenv bootmenu_2 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; else setenv bootmenu_1 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; setenv bootmenu_2; fi; setenv bootmenu_3; setenv bootmenu_default 0
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ menu_run=if test "${abl_boot_mode}" = charger; then echo "=== charger start (ABL boot mode charger): no menu, Fedora ==="; elif qcom_keys_released ${menu_keys_timeout}; then run menu_setup; bootmenu ${bootmenu_delay}; else echo "=== a key is still held: no menu, Fedora ==="; fi
+ # One boot command for both layouts: a "fedora" partition wins (dual boot); otherwise userdata holds the

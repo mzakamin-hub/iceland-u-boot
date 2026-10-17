@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Sat, 17 Oct 2026 14:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: Name the Android menu entry
+ BlissROM
+
+The power-on menu (patch 0012) offers Fedora, the Android system in
+recovery_b and the boot loader. The Pad 4's Android side is BlissROM,
+so its entry is now named "BlissROM": the menu reads Fedora / BlissROM /
+Boot loader (fastboot) once the gate is open, and Fedora / Boot loader
+before that.
+
+Only the entry's text and its comment in the install env change. The
+command (qcom_reboot_mode recovery), the gate, the order, the default
+(Fedora after 5 s) and the rehearsal env stay the same.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ board/qualcomm/iceland.env | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/board/qualcomm/iceland.env b/board/qualcomm/iceland.env
+index 55540a9a..daae9738 100644
+--- a/board/qualcomm/iceland.env
++++ b/board/qualcomm/iceland.env
+@@ -44,7 +44,7 @@ fedora_bootopt=if test -n "${bdev}" && part start blkmap ${bdev} 1 esp_start; th
+ fedora_blkmap=scsi scan && part start scsi 0 fedora fd_start && part size scsi 0 fedora fd_size && blkmap create fedora && blkmap map fedora 0 ${fd_size} linear scsi 0 ${fd_start}
+ # The power-on menu (patch 0012), after the disk is mapped: Volume Up / Volume Down move, Power selects (button-kbd
+ # makes the character when a key is RELEASED). 5 s, then the default: Fedora. "Fedora", the menu's "Exit" line and
+-# ESC leave the menu and the boot goes on as before (bootmenu runs only inside bootcmd: there is no U-Boot console). "LineageOS" only when qcom_recovery_gate is open (read only: the userdata
++# ESC leave the menu and the boot goes on as before (bootmenu runs only inside bootcmd: there is no U-Boot console). "BlissROM" (the Android entry) only when qcom_recovery_gate is open (read only: the userdata
+ # LUN also has a "fedora" partition, so userdata is Android's, and recovery_b holds an Android boot image with an
+ # arm64 kernel): store the reboot reason "recovery" for ABL, read it back, reset; ABL starts recovery_b.
+ # "Boot loader (fastboot)": the same with "bootloader" (patch 0010's reboot-bootloader store). If a store fails,
+@@ -57,7 +57,7 @@ bootmenu_delay=5
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ menu_keys_timeout=10
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+-menu_setup=setenv bootmenu_0 "Fedora=true"; if qcom_recovery_gate scsi; then setenv bootmenu_1 "LineageOS=qcom_reboot_mode recovery"; setenv bootmenu_2 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; else setenv bootmenu_1 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; setenv bootmenu_2; fi; setenv bootmenu_3; setenv bootmenu_default 0
++menu_setup=setenv bootmenu_0 "Fedora=true"; if qcom_recovery_gate scsi; then setenv bootmenu_1 "BlissROM=qcom_reboot_mode recovery"; setenv bootmenu_2 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; else setenv bootmenu_1 "Boot loader (fastboot)=qcom_reboot_mode bootloader"; setenv bootmenu_2; fi; setenv bootmenu_3; setenv bootmenu_default 0
+ # ICELAND_INSTALL_ONLY: the rehearsal build (iceland-rehearsal.env) has no such line
+ menu_run=if test "${abl_boot_mode}" = charger; then echo "=== charger start (ABL boot mode charger): no menu, Fedora ==="; elif qcom_keys_released ${menu_keys_timeout}; then run menu_setup; bootmenu ${bootmenu_delay}; else echo "=== a key is still held: no menu, Fedora ==="; fi
+ # One boot command for both layouts: a "fedora" partition wins (dual boot); otherwise userdata holds the

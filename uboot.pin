@@ -7,11 +7,13 @@ UPSTREAM_COMMIT=a06e89ab05eaa2b8344d521319399333cd760ae5
 INFINITI_URL=https://github.com/infiniti-mainline/u-boot
 INFINITI_COMMIT=bce42004f0758b477e5bb1affcf38592fe3c4a23
 TREE_AFTER_0001_infiniti=578741d3a7e31d8dbd7b26fb6ec606ef6ca70dab
-# 0002-iceland = OnePlus Pad 4 board (0001-0003) + the install build (0004-0012). Board only (0001-0003) was
+# 0002-iceland = OnePlus Pad 4 board (0001-0003) + the install build (0004-0015). Board only (0001-0003) was
 # cce06382fcfc; install build v3 (0001-0010, proven on the tablet 10 Oct 2026, U-Boot commit aac9e744ec6f) was
 # 158b0f7851ad8c18f87b8a3974abeae6021e02a3; install build v4 (0001-0012: + ABL's boot mode, the power-on boot
-# menu; U-Boot commit e0300255e054, written to boot_b on 14 Oct 2026):
-TREE_AFTER_0002_iceland=35655ad58d6ade5168ba623f7a92507cedab28f7
+# menu; U-Boot commit e0300255e054, written to boot_b on 14 Oct 2026) was 35655ad58d6ade5168ba623f7a92507cedab28f7;
+# install build v7 (0001-0015: + the stricter gate, the BlissROM entry, the Android chain from boot_a; in boot_b
+# since 17 Oct 2026, image 58414017ec3e, footered 8ef94a08d7ea):
+TREE_AFTER_0002_iceland=4f667505d646213b5ed223965107c1a4da439770
 
 # AOSP mkbootimg (Apache-2.0), LineageOS mirror, fetched at build time (not vendored)
 MKBOOTIMG_URL=https://github.com/LineageOS/android_system_tools_mkbootimg

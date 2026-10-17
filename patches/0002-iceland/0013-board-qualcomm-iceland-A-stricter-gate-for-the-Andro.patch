@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mzak <mzak.amin@gmail.com>
+Date: Fri, 16 Oct 2026 12:00:00 +0000
+Subject: [PATCH] board: qualcomm: iceland: A stricter gate for the Android
+ entry
+
+Patch 0012 offers the Android entry when the userdata disk also has a "fedora"
+partition and recovery_b starts with an Android boot image with an
+arm64 kernel. The entry stores the reboot reason "recovery"; ABL then
+verifies recovery_b against vbmeta_b's chain descriptor for "recovery"
+and starts it with init_boot_b / vendor_boot_b. Two ways that can still
+go wrong are now refused before the entry is shown:
+
+- userdata still holds the Fedora disk (a split table written with the
+  wrong ranges, or fedora added elsewhere): Android must never start on
+  it (it may format a userdata it cannot mount). The gate reads the
+  first 68 KiB of userdata and closes on a GPT header at 512 / 4096
+  bytes or a btrfs superblock at 64 KiB. Android's data (f2fs under
+  metadata encryption, or an erased partition) has neither. It also
+  closes when "fedora" and "userdata" overlap.
+- recovery_b holds a kernel without an AVB footer for "recovery":
+  an Android boot.img as built (BlissROM's) is footered for "boot" at the end of
+  the smaller boot partition, so written unchanged its footer is not at
+  the end of recovery_b. On other devices of this family a recovery
+  image ABL rejected marked the whole slot unbootable, and slot b is
+  where U-Boot lives. The gate reads recovery_b's last block and the
+  vbmeta it points to and needs a hash descriptor named "recovery" whose
+  image size is the footer's and covers the header and the kernel. The
+  signature is ABL's job (unlocked: orange state either way); this only
+  refuses an image that was not made for the recovery partition.
+
+Read only, as before: the partition tables, userdata's head, two 4 KiB
+pages and the footer / vbmeta of recovery_b. The env is unchanged.
+
+Signed-off-by: mzak <mzak.amin@gmail.com>
+---
+ arch/arm/mach-snapdragon/boot_menu.c | 152 ++++++++++++++++++++++++++-
+ 1 file changed, 149 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm/mach-snapdragon/boot_menu.c b/arch/arm/mach-snapdragon/boot_menu.c
+index 2b81a1df..9b8f5d94 100644
+--- a/arch/arm/mach-snapdragon/boot_menu.c
++++ b/arch/arm/mach-snapdragon/boot_menu.c
+@@ -17,8 +17,14 @@
+  *	"userdata" partition, the same device also has a "fedora" partition
+  *	(the disk is split, userdata is Android's), exactly one device has a
+  *	"recovery_b" partition, and that partition starts with an Android boot
+- *	image header v3 / v4 whose kernel is an arm64 Image. Reads two 4 KiB
+- *	pages of recovery_b and the partition tables, writes nothing.
++ *	image header v3 / v4 whose kernel is an arm64 Image. Also (0013):
++ *	"fedora" and "userdata" do not overlap, userdata does not start with
++ *	the Fedora disk (a GPT header or a btrfs superblock), and recovery_b
++ *	ends with an AVB footer whose vbmeta has a hash descriptor for the
++ *	partition "recovery" that covers the kernel (ABL checks recovery_b
++ *	against vbmeta's chain descriptor for "recovery"). Reads the partition
++ *	tables, two 4 KiB pages and the AVB footer / vbmeta of recovery_b and
++ *	the first 68 KiB of userdata, writes nothing.
+  */
+ 
+ #include <blk.h>
+@@ -43,6 +49,13 @@
+ #define QCOM_GATE_MAX_DEVS	16
+ #define QCOM_BOOT_PAGE		4096	/* boot image header v3 / v4: fixed 4 KiB pages */
+ #define QCOM_ARM64_MAGIC	0x644d5241	/* "ARM\x64" at offset 0x38 of an arm64 Image */
++#define QCOM_UD_HEAD		0x11000		/* GPT header at 512 / 4096, btrfs superblock at 64 KiB */
++#define QCOM_BTRFS_MAGIC_AT	0x10040
++#define QCOM_AVB_FOOTER		64		/* libavb AvbFooter, big-endian fields */
++#define QCOM_AVB_VBMETA_HDR	256		/* libavb AvbVBMetaImageHeader */
++#define QCOM_AVB_VBMETA_MAX	0x10000
++#define QCOM_AVB_HASH_DESC	2		/* AVB_DESCRIPTOR_TAG_HASH */
++#define QCOM_AVB_HASH_NAME_AT	132		/* partition name in an AvbHashDescriptor */
+ 
+ /* the number of labelled buttons that read pressed (a button that cannot be probed is skipped) */
+ static int qcom_buttons_pressed(void)
+@@ -155,6 +168,114 @@ static const char *qcom_recovery_check(const u8 *b, u64 part_bytes)
+ 	return NULL;
+ }
+ 
++/*
++ * NULL when the first QCOM_UD_HEAD bytes of userdata (@b) hold none of the
++ * Fedora disk's signatures, else the reason. Before the split userdata held
++ * the whole Fedora disk image (its GPT at 512 or 4096 bytes); Android's data
++ * (f2fs under metadata encryption, or an erased partition) has neither a GPT
++ * header nor a btrfs superblock there.
++ */
++static const char *qcom_userdata_check(const u8 *b)
++{
++	if (!memcmp(b + 512, "EFI PART", 8) || !memcmp(b + 4096, "EFI PART", 8))
++		return "userdata starts with a partition table (a Fedora disk)";
++	if (!memcmp(b + QCOM_BTRFS_MAGIC_AT, "_BHRfS_M", 8))
++		return "userdata holds a btrfs file system";
++
++	return NULL;
++}
++
++/* NULL when the vbmeta @v of @vsize bytes has a hash descriptor "recovery" of @isize bytes, else the reason */
++static const char *qcom_vbmeta_check(const u8 *v, u64 vsize, u64 isize)
++{
++	u64 auth, aux, doff, dsize, pos, tag, nf;
++	const u8 *d;
++
++	if (memcmp(v, "AVB0", 4))
++		return "the AVB footer points to no vbmeta";
++	auth = get_unaligned_be64(v + 12);
++	aux = get_unaligned_be64(v + 20);
++	doff = get_unaligned_be64(v + 96);
++	dsize = get_unaligned_be64(v + 104);
++	if (auth > vsize || aux > vsize || QCOM_AVB_VBMETA_HDR + auth + aux > vsize ||
++	    doff > aux || dsize > aux - doff)
++		return "the vbmeta is malformed";
++
++	d = v + QCOM_AVB_VBMETA_HDR + auth + doff;
++	for (pos = 0; pos + 16 <= dsize; pos += 16 + nf) {
++		tag = get_unaligned_be64(d + pos);
++		nf = get_unaligned_be64(d + pos + 8);
++		if (nf > dsize - pos - 16)
++			return "the vbmeta is malformed";
++		if (tag != QCOM_AVB_HASH_DESC || nf < QCOM_AVB_HASH_NAME_AT - 16 + 8)
++			continue;
++		if (get_unaligned_be32(d + pos + 56) != 8 ||
++		    memcmp(d + pos + QCOM_AVB_HASH_NAME_AT, "recovery", 8))
++			continue;
++		if (get_unaligned_be64(d + pos + 16) != isize)
++			return "the hash descriptor for recovery does not cover the image";
++		return NULL;
++	}
++
++	return "the vbmeta has no hash descriptor for recovery";
++}
++
++/*
++ * NULL when recovery_b (@p of @desc) ends with an AVB footer whose image covers
++ * the boot image header and its kernel of @ksize bytes and whose vbmeta holds a
++ * hash descriptor for "recovery", else the reason. An Android boot.img as
++ * built (BlissROM's) carries a footer for "boot" at the end of the (smaller) boot
++ * partition: written to recovery_b unchanged it has no footer at the end.
++ */
++static const char *qcom_avb_check(struct blk_desc *desc, struct disk_partition *p, u32 ksize)
++{
++	u64 bytes = (u64)p->size * desc->blksz, isize, voff, vsize;
++	const char *why = NULL;
++	lbaint_t first, n;
++	const u8 *f;
++	u8 *buf;
++
++	if (desc->blksz < QCOM_AVB_FOOTER || !p->size)
++		return "recovery_b has no room for an AVB footer";
++	buf = memalign(ARCH_DMA_MINALIGN, desc->blksz);
++	if (!buf)
++		return "out of memory";
++	if (blk_dread(desc, p->start + p->size - 1, 1, buf) != 1) {
++		free(buf);
++		return "the end of recovery_b cannot be read";
++	}
++	f = buf + desc->blksz - QCOM_AVB_FOOTER;
++	isize = get_unaligned_be64(f + 12);
++	voff = get_unaligned_be64(f + 20);
++	vsize = get_unaligned_be64(f + 28);
++	if (memcmp(f, "AVBf", 4) || get_unaligned_be32(f + 4) != 1)
++		why = "no AVB footer at the end of the partition";
++	else if (isize < (u64)QCOM_BOOT_PAGE + ksize || isize > bytes - QCOM_AVB_FOOTER)
++		why = "the AVB footer does not cover the kernel";
++	else if (vsize < QCOM_AVB_VBMETA_HDR || vsize > QCOM_AVB_VBMETA_MAX || voff < isize ||
++		 voff > bytes - QCOM_AVB_FOOTER - vsize)
++		why = "the AVB footer's vbmeta is out of range";
++	free(buf);
++	if (why)
++		return why;
++
++	first = voff / desc->blksz;
++	n = DIV_ROUND_UP(voff % desc->blksz + vsize, desc->blksz);
++	buf = memalign(ARCH_DMA_MINALIGN, n * desc->blksz);
++	if (!buf)
++		return "out of memory";
++	if (blk_dread(desc, p->start + first, n, buf) != n)
++		why = "the vbmeta of recovery_b cannot be read";
++	else
++		why = qcom_vbmeta_check(buf + voff % desc->blksz, vsize, isize);
++	if (!why)
++		printf("=== recovery gate: recovery_b has an AVB footer for recovery (%llu bytes) ===\n",
++		       (unsigned long long)isize);
++	free(buf);
++
++	return why;
++}
++
+ static int do_qcom_recovery_gate(struct cmd_tbl *cmdtp, int flag, int argc,
+ 				 char *const argv[])
+ {
+@@ -183,6 +304,28 @@ static int do_qcom_recovery_gate(struct cmd_tbl *cmdtp, int flag, int argc,
+ 		       "the fedora partition is not on the userdata disk");
+ 		return CMD_RET_FAILURE;
+ 	}
++	if (fd.start < ud.start + ud.size && ud.start < fd.start + fd.size) {
++		printf("=== recovery gate: the fedora partition overlaps userdata: closed ===\n");
++		return CMD_RET_FAILURE;
++	}
++	nblk = DIV_ROUND_UP(QCOM_UD_HEAD, udesc->blksz);
++	if (ud.size < nblk) {
++		printf("=== recovery gate: userdata is too small: closed ===\n");
++		return CMD_RET_FAILURE;
++	}
++	buf = memalign(ARCH_DMA_MINALIGN, nblk * udesc->blksz);
++	if (!buf)
++		return CMD_RET_FAILURE;
++	if (blk_dread(udesc, ud.start, nblk, buf) != nblk)
++		why = "userdata cannot be read";
++	else
++		why = qcom_userdata_check(buf);
++	free(buf);
++	if (why) {
++		printf("=== recovery gate: %s: closed ===\n", why);
++		return CMD_RET_FAILURE;
++	}
++
+ 	ret = qcom_find_part(iface, "recovery_b", &rdesc, &rb);
+ 	if (ret) {
+ 		printf("=== recovery gate: %s recovery_b partition: closed ===\n",
+@@ -202,6 +345,8 @@ static int do_qcom_recovery_gate(struct cmd_tbl *cmdtp, int flag, int argc,
+ 		why = "recovery_b cannot be read";
+ 	else
+ 		why = qcom_recovery_check(buf, (u64)rb.size * rdesc->blksz);
++	if (!why)
++		why = qcom_avb_check(rdesc, &rb, get_unaligned_le32(buf + 8));
+ 	if (!why)
+ 		printf("%s (%u bytes): open ===\n",
+ 		       "=== recovery gate: fedora next to userdata, recovery_b holds an Android kernel",
+@@ -221,4 +366,5 @@ U_BOOT_CMD(qcom_keys_released, 2, 0, do_qcom_keys_released,
+ 
+ U_BOOT_CMD(qcom_recovery_gate, 2, 0, do_qcom_recovery_gate,
+ 	   "check that recovery_b can start another OS (read only)",
+-	   "[interface]  - default scsi: userdata + fedora on one disk, an Android kernel in recovery_b");
++	   "[interface]  - default scsi: userdata (not the Fedora disk) + fedora on one disk, an Android kernel\n"
++	   "    with an AVB footer for recovery in recovery_b");
