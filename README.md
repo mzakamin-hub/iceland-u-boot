@@ -7,14 +7,15 @@ Current state (17 Oct 2026): the U-Boot install build **v7** (0001-0015) is the 
 of the dual boot with BlissROM: it sits in `boot_b` and shows a power-on menu **Fedora / BlissROM / Boot loader
 (fastboot)**. Fedora starts from a `fedora` partition (dual-boot layout) or from the disk image in `userdata` (Fedora
 only). The BlissROM entry boots Android's kernel from `boot_a` with the ramdisk and device tree ABL prepared (patch
-0015). See [Installing](#installing) and the
-[dual-boot guide](https://github.com/mzakamin-hub/iceland-mainline/blob/main/docs/DUAL-BOOT.md).
+0015). See [Installing](#installing), the U-Boot side of the dual boot in [docs/DUAL-BOOT.md](docs/DUAL-BOOT.md),
+and the full [dual-boot guide](https://github.com/mzakamin-hub/iceland-mainline/blob/main/docs/DUAL-BOOT.md).
 
 | Path | Content |
 |---|---|
 | `uboot.pin` | upstream tag, infiniti commit, expected tree hashes, mkbootimg pin, boot header values |
 | `patches/0001-infiniti/` | 14 commits from infiniti-mainline/u-boot `main`: Kaanapali clocks, eUSB2, PMIC arbiter v8, ABL memory map pass-through, EFI from userdata, OnePlus 15 |
 | `patches/0002-iceland/` | the OnePlus Pad 4 board (0001-0003, DTS, `iceland_defconfig`, `iceland.env`) and the install build (0004-0015, below) |
+| `docs/DUAL-BOOT.md` | the dual boot BlissROM + Fedora from U-Boot's side: the menu, the gate, how BlissROM starts, building, testing and writing v7, the limits |
 | `tools/install/` | `BUILD_INFO-v3.txt` and `SHA256SUMS-v3.txt`: the record of the install build v3 |
 | `scripts/prepare.sh`, `scripts/build.sh` | source tree with verified hashes; U-Boot and the boot images |
 
@@ -38,7 +39,7 @@ Release [`v4-2026-10-15`](https://github.com/mzakamin-hub/iceland-u-boot/release
 | `u-boot-iceland-v4-footered.img` (AVB-footered for `boot_b`) | `b714356adf54d4e4db77447716f6d07d834f56af90e75f537e0080be860c9af6` |
 
 The footered image is signed with the public AOSP test key and carries the footer values of the reference
-LineageOS (test-keys) `boot_b` (rollback index `1788220800`, os_version 17, security_patch 2026-09-01); it fits
+tablet's `boot_b` (an Android 17 test-keys build; rollback index `1788220800`, os_version 17, security_patch 2026-09-01); it fits
 only a tablet whose `boot_b` footer has the same values. Otherwise make the footer locally from the plain image:
 [iceland-mainline/tools/installer/README-INSTALLER.md](https://github.com/mzakamin-hub/iceland-mainline/blob/main/tools/installer/README-INSTALLER.md).
 
@@ -137,4 +138,6 @@ made for the tablet's current `boot_b`, into `boot_b`. The requirements, the ste
 [iceland-mainline/docs/INSTALL-GUIDE.md](https://github.com/mzakamin-hub/iceland-mainline/blob/main/docs/INSTALL-GUIDE.md).
 A later U-Boot update is the same `boot_b` write with a newly footered build. The dual boot with BlissROM (partition
 layout, the Android images and where each goes) is in
-[iceland-mainline/docs/DUAL-BOOT.md](https://github.com/mzakamin-hub/iceland-mainline/blob/main/docs/DUAL-BOOT.md).
+[iceland-mainline/docs/DUAL-BOOT.md](https://github.com/mzakamin-hub/iceland-mainline/blob/main/docs/DUAL-BOOT.md);
+U-Boot's part of it (the menu, the gate, the BlissROM start, the RAM test and the `boot_b` write of v7, the undo) is in
+[docs/DUAL-BOOT.md](docs/DUAL-BOOT.md).

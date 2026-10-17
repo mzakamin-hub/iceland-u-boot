@@ -20,10 +20,9 @@ MKBOOTIMG_URL=https://github.com/LineageOS/android_system_tools_mkbootimg
 MKBOOTIMG_COMMIT=808ecd09666ffe0ff5800f02af693abce56eb395
 
 # Boot image header values: must match the boot image in the slot that will be written (anti-rollback; ABL also
-# hands the AVB footer's os_version / security_patch to the TEE). The tablet runs LineageOS on slot b since
-# 28 Sep 2026; its boot_b header read by the install workflow's Part A on 2 Oct 2026: Android 17, patch level
-# 2026-09 (footer security_patch 2026-09-01). The install build (wf/install mk-uboot.sh) takes these values from
-# the day's boot_b pull and falls back to the ones below; check-header.py refuses a mismatch before any write.
-# (Stock OxygenOS 11.A.38 had Android 16 / 2026-08.)
+# hands the AVB footer's os_version / security_patch to the TEE). The reference tablet's boot_b (an Android 17
+# test-keys build, read 2 Oct 2026, before U-Boot went into boot_b): Android 17, patch level 2026-09 (footer
+# security_patch 2026-09-01). Read your own boot_b header and footer before a write and use its values if they
+# differ. (Stock OxygenOS 11.A.38 had Android 16 / 2026-08.)
 BOOT_OS_VERSION=17.0.0
 BOOT_OS_PATCH_LEVEL=2026-09
