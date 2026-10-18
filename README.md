@@ -27,9 +27,15 @@ Licence: GPL-2.0+ (U-Boot `Licenses/`). The boot image header values must match 
 
 ## Download
 
-The install build v7 (0001-0015) is not released as a download yet: build it with `scripts/prepare.sh` +
-`scripts/build.sh` (its hashes are under [Install build](#install-build-patches-0004-0015)). The last release is v4
-(0001-0012, no BlissROM entry):
+Release [`v7-2026-10-17`](https://github.com/mzakamin-hub/iceland-u-boot/releases/tag/v7-2026-10-17) (0001-0015,
+the menu Fedora / BlissROM / Boot loader):
+
+| File | SHA-256 |
+|---|---|
+| `u-boot-iceland-v7.img` (plain, for `fastboot boot` RAM tests) | `58414017ec3e2b496905b078d2bd1db8ca9bea9a171bdaf44797dcf0671eb784` |
+| `u-boot-iceland-v7-footered.img` (AVB-footered for `boot_b`) | `8ef94a08d7eabac35c8bc97173fa818f13c2d1e53ff14375bcf1207c614f68a3` |
+
+The way back is the v4 release below (footered `b714356a`). Earlier release (0001-0012, no BlissROM entry):
 
 Release [`v4-2026-10-15`](https://github.com/mzakamin-hub/iceland-u-boot/releases/tag/v4-2026-10-15) (source `382c39f`):
 
@@ -38,7 +44,7 @@ Release [`v4-2026-10-15`](https://github.com/mzakamin-hub/iceland-u-boot/release
 | `u-boot-iceland-v4.img` (plain, for `fastboot boot` RAM tests) | `23ff0be6b688560de8a63c5c49cf99b10a0a023fd36f4d9542edcf2660ef2c84` |
 | `u-boot-iceland-v4-footered.img` (AVB-footered for `boot_b`) | `b714356adf54d4e4db77447716f6d07d834f56af90e75f537e0080be860c9af6` |
 
-The footered image is signed with the public AOSP test key and carries the footer values of the reference
+The footered images are signed with the public AOSP test key and carry the footer values of the reference
 tablet's `boot_b` (an Android 17 test-keys build; rollback index `1788220800`, os_version 17, security_patch 2026-09-01); it fits
 only a tablet whose `boot_b` footer has the same values. Otherwise make the footer locally from the plain image:
 [iceland-mainline/tools/installer/README-INSTALLER.md](https://github.com/mzakamin-hub/iceland-mainline/blob/main/tools/installer/README-INSTALLER.md).
@@ -101,7 +107,7 @@ Tested on the tablet (RAM boots write nothing; every test write of `boot_b` was 
   then `boot_b`: the menu shows Fedora / BlissROM / Boot loader; BlissROM starts and keeps its data across starts,
   Fedora starts from the `fedora` partition. On the Fedora-only layout the gate stays closed (Fedora / Boot loader).
 
-Build images of v7 (sha256; the images are not published yet):
+Build images of v7 (sha256; the install images are in the release `v7-2026-10-17`):
 
 | Image | sha256 |
 |---|---|
